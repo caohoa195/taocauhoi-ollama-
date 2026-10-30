@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix Tạo ngân hàng CH và đề thi (bản chuẩn)",
+  "description": "An AI-powered application for generating university-level Physics, Math, and English exams and automated grading.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
