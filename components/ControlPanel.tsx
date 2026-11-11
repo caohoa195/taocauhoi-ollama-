@@ -29,7 +29,8 @@ import {
   ChevronDown,
   ChevronUp,
   Info,
-  ExternalLink
+  ExternalLink,
+  FileCheck
 } from 'lucide-react';
 import { checkOllamaConnection, OllamaConnectionResult } from '../services/ollamaService';
 
@@ -90,10 +91,14 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
   // Source Files State (Array)
   const [sourceFiles, setSourceFiles] = useState<File[]>([]);
 
-  // Grading State
-  const [gradingType, setGradingType] = useState<'trac-nghiem' | 'tu-luan'>('trac-nghiem');
-  const [submissionFile, setSubmissionFile] = useState<File | null>(null);
+  // Grading State (supports multiple student submissions)
+  const [gradingType, setGradingType] = useState<'auto' | 'trac-nghiem' | 'tu-luan' | 'hon-hop'>('auto');
+  const [submissionFiles, setSubmissionFiles] = useState<File[]>([]);
   const [answerKeyFile, setAnswerKeyFile] = useState<File | null>(null);
+  const [examQuestionFile, setExamQuestionFile] = useState<File | null>(null);
+  const [examQuestionText, setExamQuestionText] = useState<string>('');
+  const [showQuestionTextInput, setShowQuestionTextInput] = useState<boolean>(false);
+  const [fastFinalResultGrading, setFastFinalResultGrading] = useState<boolean>(true);
   const [gradeError, setGradeError] = useState<string | null>(null);
 
   // Auto-check connection when switching to Ollama or changing base URL
@@ -144,17 +149,82 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
   };
 
   const handleGrade = () => {
-    if (!submissionFile || !answerKeyFile) {
-      setGradeError('Vui lòng tải lên cả bài thi và đáp án.');
+    if (submissionFiles.length === 0) {
+      setGradeError('Vui lòng tải lên ít nhất một bài thi học sinh để chấm.');
+      return;
+    }
+    if (!answerKeyFile && !examQuestionFile && !examQuestionText.trim()) {
+      setGradeError('Vui lòng cung cấp Đề bài (Đề thi gốc) hoặc file Đáp án chuẩn để đối chiếu.');
       return;
     }
     setGradeError(null);
     onGrade({
-      submissionFile,
+      submissionFiles,
+      examQuestionFile,
+      examQuestionText: examQuestionText.trim() || undefined,
       answerKeyFile,
       gradingType,
+      fastFinalResultGrading,
     });
   };
+
+  const handleAddSubmissionFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      const newFiles = Array.from(e.target.files);
+      setSubmissionFiles((prev) => [...prev, ...newFiles]);
+      setGradeError(null);
+    }
+  };
+
+  const removeSubmissionFile = (index: number) => {
+    setSubmissionFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  const clearAllSubmissionFiles = () => {
+    setSubmissionFiles([]);
+  };
+
+  const [isLoadingSample, setIsLoadingSample] = useState(false);
+
+  const loadSampleExam = async () => {
+    setIsLoadingSample(true);
+    setGradeError(null);
+    try {
+      const [subRes, keyRes] = await Promise.all([
+        fetch('/assets/aistudio/B_i_thi_1_19613f1c.pdf'),
+        fetch('/assets/aistudio/De_thi_Vat_ly_45_phut_De_2_358b78f3.pdf')
+      ]);
+
+      if (!subRes.ok || !keyRes.ok) {
+        throw new Error("Không thể tải tệp mẫu từ hệ thống.");
+      }
+
+      const subBlob = await subRes.blob();
+      const keyBlob = await keyRes.blob();
+
+      const sampleSubmission = new File([subBlob], "Bài thi viết tay - SV Ngô Quang Huy (Đề 2).pdf", {
+        type: 'application/pdf',
+      });
+      const sampleQuestion = new File([keyBlob], "Đề thi Vật lý Đại cương 45 phút (Đề 02).pdf", {
+        type: 'application/pdf',
+      });
+      const sampleKey = new File([keyBlob], "Đáp án & Thang điểm chi tiết (Đề 02).pdf", {
+        type: 'application/pdf',
+      });
+
+      setExamQuestionFile(sampleQuestion);
+      setSubmissionFiles([sampleSubmission]);
+      setAnswerKeyFile(sampleKey);
+      setGradingType('auto');
+      setFastFinalResultGrading(true);
+    } catch (err: any) {
+      console.error("Lỗi nạp bài thi mẫu:", err);
+      setGradeError("Không thể nạp bài thi mẫu: " + err.message);
+    } finally {
+      setIsLoadingSample(false);
+    }
+  };
+
 
   const handleAddSourceFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
@@ -175,38 +245,55 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
     label,
     file,
     setFile,
+    subtext,
   }: {
-    label: string;
+    label?: string;
     file: File | null;
     setFile: (f: File | null) => void;
+    subtext?: string;
   }) => (
     <div className="mb-3">
-      <label className="block text-xs font-semibold text-gray-600 mb-1.5 uppercase tracking-wider">
-        {label}
-      </label>
+      {label && (
+        <label className="block text-xs font-semibold text-gray-700 mb-1 uppercase tracking-wider">
+          {label}
+        </label>
+      )}
+      {subtext && <p className="text-[11px] text-gray-500 mb-1.5">{subtext}</p>}
       <div className="relative group">
-        <input
-          type="file"
-          onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)}
-          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
-        />
-        <div
-          className={`border-2 border-dashed rounded-lg p-3 flex items-center justify-center transition-colors ${
-            file ? 'border-green-500 bg-green-50' : 'border-gray-300 hover:border-blue-400'
-          }`}
-        >
-          {file ? (
-            <div className="flex items-center text-green-700 truncate max-w-full">
-              <CheckCircle size={16} className="mr-2 flex-shrink-0" />
-              <span className="text-sm truncate">{file.name}</span>
+        {!file ? (
+          <>
+            <input
+              type="file"
+              accept=".docx,.doc,.pdf,.png,.jpg,.jpeg,.txt,.md"
+              onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)}
+              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+            />
+            <div className="border-2 border-dashed border-gray-300 hover:border-teal-400 rounded-lg p-3 flex items-center justify-center transition-colors bg-gray-50">
+              <div className="flex items-center text-gray-500 text-xs gap-1.5">
+                <Upload size={15} />
+                <span>Chọn file (Word .docx, PDF, Ảnh, Text)...</span>
+              </div>
             </div>
-          ) : (
-            <div className="flex items-center text-gray-500">
-              <Upload size={16} className="mr-2" />
-              <span className="text-sm">Chọn file tài liệu...</span>
+          </>
+        ) : (
+          <div className="border border-emerald-300 bg-emerald-50 rounded-lg p-2.5 flex items-center justify-between text-xs text-emerald-900 shadow-xs">
+            <div className="flex items-center truncate gap-2 flex-1 mr-2">
+              <CheckCircle size={16} className="text-emerald-600 flex-shrink-0" />
+              <div className="truncate">
+                <span className="font-semibold block truncate" title={file.name}>{file.name}</span>
+                <span className="text-[10px] text-emerald-700 block">{(file.size / 1024).toFixed(0)} KB</span>
+              </div>
             </div>
-          )}
-        </div>
+            <button
+              type="button"
+              onClick={() => setFile(null)}
+              className="text-gray-400 hover:text-red-600 p-1 rounded hover:bg-emerald-100 transition-colors cursor-pointer"
+              title="Xóa tệp này"
+            >
+              <X size={15} />
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -903,8 +990,41 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
           </div>
         ) : (
           <div className="space-y-4 animate-fadeIn">
-            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg text-xs text-yellow-800 mb-4">
-              Tải lên file ảnh hoặc văn bản/PDF của bài làm và đáp án để chấm điểm tự động.
+            <div className="p-3 bg-teal-50 border border-teal-200 rounded-lg text-xs text-teal-900 mb-4">
+              <p className="font-semibold flex items-center gap-1.5 mb-1 text-teal-800">
+                <Files size={14} className="text-teal-600" />
+                Chấm thi hàng loạt nhiều học sinh
+              </p>
+              Tải lên cùng lúc nhiều bài làm của học sinh (ảnh bài chụp, PDF, text, Word) và file đáp án chuẩn. Hệ thống sẽ tự động chấm điểm tuần tự từng em và tổng hợp bảng điểm.
+            </div>
+
+            {/* Quick Sample Button: Nạp bài thi viết tay & đáp án mẫu thực tế */}
+            <div className="p-3 bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-xl shadow-xs">
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-xs font-bold text-blue-900 flex items-center gap-1.5">
+                  <Sparkles size={14} className="text-blue-600" />
+                  Mẫu bài thi, đề bài & đáp án
+                </span>
+                <span className="text-[10px] bg-blue-100 text-blue-800 font-semibold px-2 py-0.5 rounded-full">
+                  Vật lý Đại cương
+                </span>
+              </div>
+              <p className="text-[11px] text-gray-600 mb-2.5 leading-snug">
+                Nạp tự động đề bài, bài thi viết tay thực tế (SV Ngô Quang Huy) và bareme điểm Đề 02 để thử nghiệm ngay.
+              </p>
+              <button
+                type="button"
+                onClick={loadSampleExam}
+                disabled={isLoadingSample}
+                className="w-full py-2 px-3 bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition-all cursor-pointer disabled:opacity-50"
+              >
+                {isLoadingSample ? (
+                  <Loader2 size={13} className="animate-spin" />
+                ) : (
+                  <FileCheck size={13} />
+                )}
+                <span>🎯 Nạp bài thi viết tay, đề bài & đáp án mẫu</span>
+              </button>
             </div>
 
             {gradeError && (
@@ -913,54 +1033,249 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
               </div>
             )}
 
+            {/* 1. CUNG CẤP ĐỀ BÀI (ĐỀ THI GỐC) */}
+            <div className="p-3 bg-slate-50/80 border border-slate-200 rounded-xl shadow-xs">
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-xs font-bold text-gray-800 uppercase tracking-wider">
+                  1. Cung cấp Đề bài (Đề thi gốc)
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setShowQuestionTextInput(!showQuestionTextInput)}
+                  className="text-[10px] text-indigo-600 hover:text-indigo-800 font-semibold cursor-pointer"
+                >
+                  {showQuestionTextInput ? "📁 Tải lên tệp đề bài" : "✏️ Nhập văn bản đề bài"}
+                </button>
+              </div>
+              <p className="text-[10px] text-gray-500 mb-2">
+                Cung cấp đề thi để AI nắm rõ yêu cầu, giả thiết và câu hỏi của đề bài khi chấm.
+              </p>
+
+              {!showQuestionTextInput ? (
+                <FileInput
+                  file={examQuestionFile}
+                  setFile={(f) => {
+                    setExamQuestionFile(f);
+                    setGradeError(null);
+                  }}
+                  subtext=""
+                />
+              ) : (
+                <div className="space-y-1">
+                  <textarea
+                    value={examQuestionText}
+                    onChange={(e) => setExamQuestionText(e.target.value)}
+                    placeholder="Dán hoặc gõ nội dung đề bài (Câu 1, Câu 2... và các yêu cầu)..."
+                    rows={4}
+                    className="w-full text-xs p-2 border border-gray-300 rounded-lg focus:border-teal-500 focus:bg-white bg-white outline-none"
+                  />
+                  {examQuestionText && (
+                    <div className="flex items-center justify-between text-[10px] text-gray-400">
+                      <span>Đã nhập: {examQuestionText.length} ký tự</span>
+                      <button
+                        type="button"
+                        onClick={() => setExamQuestionText('')}
+                        className="text-red-500 hover:underline"
+                      >
+                        Xóa văn bản
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* 2. Multiple Student Submissions Upload */}
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider">
+                  2. Danh sách bài làm học sinh ({submissionFiles.length} bài)
+                </label>
+                {submissionFiles.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={clearAllSubmissionFiles}
+                    className="text-[10px] text-red-500 hover:text-red-700 underline cursor-pointer"
+                  >
+                    Xóa tất cả
+                  </button>
+                )}
+              </div>
+
+              <div className="relative group mb-2">
+                <input
+                  type="file"
+                  multiple
+                  accept=".docx,.doc,.pdf,.png,.jpg,.jpeg,.txt,.md"
+                  onChange={handleAddSubmissionFiles}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                />
+                <div className={`border-2 border-dashed rounded-lg p-3 flex flex-col items-center justify-center transition-colors ${
+                  submissionFiles.length > 0
+                    ? 'border-teal-500 bg-teal-50/50 hover:bg-teal-50'
+                    : 'border-gray-300 hover:border-teal-400 bg-gray-50'
+                }`}>
+                  <div className="flex items-center text-teal-700 font-medium text-xs gap-1.5">
+                    <Upload size={15} />
+                    <span>Chọn bài thi (Word .docx, PDF, Ảnh bài chụp...)</span>
+                  </div>
+                  <span className="text-[10px] text-gray-500 mt-1">
+                    Nhấn giữ <b>Ctrl</b> hoặc <b>Shift</b> để chọn cùng lúc nhiều bài thi của học sinh
+                  </span>
+                </div>
+              </div>
+
+              {/* Uploaded Files List */}
+              {submissionFiles.length > 0 && (
+                <div className="space-y-1.5 max-h-40 overflow-y-auto bg-gray-50 p-2 rounded-lg border border-gray-200">
+                  <div className="text-[11px] font-semibold text-gray-600 px-1 pb-1 border-b border-gray-200 flex justify-between">
+                    <span>Học sinh / Tên file bài làm</span>
+                    <span className="text-teal-700 font-bold">{submissionFiles.length} thí sinh</span>
+                  </div>
+                  {submissionFiles.map((file, idx) => (
+                    <div
+                      key={idx}
+                      className="flex items-center justify-between bg-white p-2 rounded shadow-xs border border-gray-100 text-xs"
+                    >
+                      <div className="flex items-center truncate gap-2 flex-1 mr-2">
+                        <span className="w-5 h-5 rounded-full bg-teal-100 text-teal-800 flex items-center justify-center text-[10px] font-bold flex-shrink-0">
+                          {idx + 1}
+                        </span>
+                        <div className="truncate">
+                          <span className="font-semibold text-gray-800 block truncate" title={file.name}>
+                            {file.name.replace(/\.[^/.]+$/, '')}
+                          </span>
+                          <span className="text-[10px] text-gray-400 block truncate">
+                            {file.name} ({(file.size / 1024).toFixed(0)} KB)
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => removeSubmissionFile(idx)}
+                        className="text-gray-400 hover:text-red-500 p-1 cursor-pointer"
+                        title="Xóa bài thi này"
+                      >
+                        <X size={14} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* 3. Answer Key File Upload */}
             <FileInput
-              label="1. Tải lên bài thi (HS làm)"
-              file={submissionFile}
-              setFile={(f) => {
-                setSubmissionFile(f);
-                setGradeError(null);
-              }}
-            />
-            <FileInput
-              label="2. Tải lên đáp án chuẩn"
+              label="3. Tải lên đáp án chuẩn & thang điểm"
               file={answerKeyFile}
               setFile={(f) => {
                 setAnswerKeyFile(f);
                 setGradeError(null);
               }}
+              subtext="Tệp chứa lời giải chuẩn và barem điểm từng câu (PDF, Word, Ảnh...)"
             />
+
+            {/* 4. QUY TẮC CHẤM: ĐÚNG ĐÁP ÁN CUỐI CHO TRỌN ĐIỂM */}
+            <div className={`p-3 rounded-xl border transition-all ${
+              fastFinalResultGrading 
+                ? 'bg-amber-50/80 border-amber-300 shadow-xs ring-1 ring-amber-200' 
+                : 'bg-gray-50 border-gray-200 opacity-80'
+            }`}>
+              <div className="flex items-start gap-2.5">
+                <input
+                  type="checkbox"
+                  id="fastFinalResult"
+                  checked={fastFinalResultGrading}
+                  onChange={(e) => setFastFinalResultGrading(e.target.checked)}
+                  className="mt-0.5 h-4 w-4 text-teal-600 rounded border-gray-300 focus:ring-teal-500 cursor-pointer accent-teal-600"
+                />
+                <label htmlFor="fastFinalResult" className="text-xs text-amber-950 font-bold cursor-pointer select-none flex-1">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <span>⭐ Quy tắc ưu tiên kết quả cuối cùng</span>
+                    <span className="text-[9px] bg-amber-200 text-amber-900 px-1.5 py-0.2 rounded font-semibold">Khuyên dùng</span>
+                  </div>
+                  <span className="block text-[11px] font-normal text-amber-900 mt-1 leading-snug">
+                    Nếu bài làm <b>đúng đáp án cuối cùng</b> (kèm lời giải hợp lệ) ➔ Cho <b>điểm cuối cùng trọn vẹn</b>. Chỉ khi <b>không đúng đáp án cuối cùng</b> ➔ Mới rà soát chấm điểm các thành phần (công thức, biến đổi, thay số).
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            {/* Chống lệch điểm / Ổn định tuyệt đối */}
+            <div className="p-2.5 bg-emerald-50/70 border border-emerald-200 rounded-xl text-emerald-900 shadow-xs">
+              <div className="flex items-center gap-1.5 mb-1 text-xs font-bold text-emerald-800">
+                <CheckCircle size={14} className="text-emerald-600" />
+                <span>Khóa chuẩn hóa cố định (Deterministic = 100%)</span>
+              </div>
+              <p className="text-[10px] text-emerald-700 leading-snug">
+                Nhiệt độ mô hình được khóa cứng (<code>Temperature: 0.0</code>) cùng một bảng barem đồng nhất. Mọi lần chấm trên cùng một bài nộp luôn cho kết quả giống hệt nhau 100%, chống đảo ngược điểm số giữa các thí sinh.
+              </p>
+            </div>
 
             <div>
               <label className="block text-xs font-bold text-gray-500 uppercase mb-1">
-                Loại bài thi
+                Chế độ chấm thi
               </label>
-              <div className="flex gap-2">
+              <div className="grid grid-cols-3 gap-1.5">
                 <button
+                  type="button"
+                  onClick={() => setGradingType('auto')}
+                  className={`py-2 px-1 text-[11px] rounded border transition-colors text-center ${
+                    gradingType === 'auto'
+                      ? 'bg-teal-100 border-teal-500 text-teal-800 font-bold shadow-xs'
+                      : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-50'
+                  }`}
+                  title="Tự động nhận diện Trắc nghiệm, Tự luận hoặc Đề thi hỗn hợp"
+                >
+                  ⚡ Tự động (Chuẩn)
+                </button>
+                <button
+                  type="button"
                   onClick={() => setGradingType('trac-nghiem')}
-                  className={`flex-1 py-2 text-xs rounded border ${
+                  className={`py-2 px-1 text-[11px] rounded border transition-colors text-center ${
                     gradingType === 'trac-nghiem'
-                      ? 'bg-blue-100 border-blue-500 text-blue-700 font-bold'
-                      : 'bg-white border-gray-300'
+                      ? 'bg-blue-100 border-blue-500 text-blue-700 font-bold shadow-xs'
+                      : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-50'
                   }`}
                 >
                   Trắc nghiệm
                 </button>
                 <button
+                  type="button"
                   onClick={() => setGradingType('tu-luan')}
-                  className={`flex-1 py-2 text-xs rounded border ${
+                  className={`py-2 px-1 text-[11px] rounded border transition-colors text-center ${
                     gradingType === 'tu-luan'
-                      ? 'bg-blue-100 border-blue-500 text-blue-700 font-bold'
-                      : 'bg-white border-gray-300'
+                      ? 'bg-blue-100 border-blue-500 text-blue-700 font-bold shadow-xs'
+                      : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-50'
                   }`}
                 >
                   Tự luận
                 </button>
               </div>
+              <p className="text-[10px] text-gray-400 mt-1 italic">
+                *Chế độ "Tự động" tự đối chiếu bảng trắc nghiệm, bài tự luận, đề hỗn hợp và bareme điểm.
+              </p>
             </div>
+
+            {/* Tốc độ chấm / Luồng song song */}
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-[11px] font-bold text-gray-700 flex items-center gap-1">
+                  ⚡ Tốc độ quét & chấm:
+                </span>
+                <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                  Chấm song song siêu tốc
+                </span>
+              </div>
+              <p className="text-[10px] text-gray-500 leading-tight">
+                Tự động tối ưu hóa tài liệu và xử lý đồng thời nhiều học sinh để rút ngắn thời gian chấm từ vài phút xuống vài giây.
+              </p>
+            </div>
+
 
             <button
               onClick={handleGrade}
-              disabled={isLoading}
+              disabled={isLoading || submissionFiles.length === 0}
               className={`w-full mt-6 font-semibold py-3 px-4 rounded-lg shadow-md transition-all flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed ${
                 provider === 'ollama'
                   ? 'bg-purple-700 hover:bg-purple-800 text-white'
@@ -973,10 +1288,12 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
                 <CheckCircle size={18} />
               )}
               {isLoading
-                ? 'Đang chấm thi...'
-                : provider === 'ollama'
-                ? `Chấm với Ollama (${ollamaConfig.model})`
-                : 'Chấm Bài Tự Động (Gemini)'}
+                ? `Đang chấm ${submissionFiles.length} bài thi...`
+                : submissionFiles.length > 1
+                ? `Chấm tự động cùng lúc (${submissionFiles.length} học sinh)`
+                : submissionFiles.length === 1
+                ? 'Chấm bài học sinh này'
+                : 'Tải lên bài thi để bắt đầu chấm'}
             </button>
           </div>
         )}

@@ -49,15 +49,40 @@ export interface GeneratedContent {
 }
 
 export interface GradingConfig {
-  submissionFile: File | null;
+  submissionFiles: File[];
+  examQuestionFile?: File | null;
+  examQuestionText?: string;
   answerKeyFile: File | null;
-  gradingType: 'trac-nghiem' | 'tu-luan';
+  answerKeyText?: string;
+  gradingType: 'auto' | 'trac-nghiem' | 'tu-luan' | 'hon-hop';
+  fastFinalResultGrading?: boolean; // Đúng đáp án cuối cùng cho điểm trọn vẹn, không đúng mới chấm điểm các thành phần
+}
+
+export interface StudentGradingResult {
+  id: string;
+  studentName: string;
+  studentId?: string;
+  className?: string;
+  examCode?: string;
+  fileName: string;
+  score: string;
+  feedback: string;
+  status: 'pending' | 'grading' | 'done' | 'error';
+  error?: string;
+}
+
+export interface MultiGradingSummary {
+  total: number;
+  completed: number;
+  averageScore?: string;
+  results: StudentGradingResult[];
 }
 
 export interface GradingResult {
   feedback: string;
   score: string;
 }
+
 
 export interface FileData {
   inlineData: {

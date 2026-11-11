@@ -48,15 +48,23 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content }) => {
                 return <div className={className} {...props}>{children}</div>;
             },
             table({ children, ...props }) {
-                // Heuristic: Check if this is a "Header Layout" table by looking for "KHOA" or "BỘ MÔN"
+                // Heuristic: Check if this is a "Header Layout" or "Signature" table
                 const isHeaderTable = hasText(children, "KHOA") || hasText(children, "BỘ MÔN");
+                const isSignatureTable = hasText(children, "CÁN BỘ CHẤM THI") || hasText(children, "GIÁM KHẢO");
                 
                 if (isHeaderTable) {
-                    // Header Table: No borders, very tight spacing (leading-none), no bottom margin
                     return <table className="w-full border-collapse mb-2 leading-none" {...props}>{children}</table>;
                 }
+
+                if (isSignatureTable) {
+                    return (
+                        <div className="mt-8 mb-6 overflow-x-auto">
+                            <table className="w-full border-none border-collapse text-center" {...props}>{children}</table>
+                        </div>
+                    );
+                }
                 
-                // Default: Standard data table with borders (for Answer Key Body)
+                // Default: Standard data table with borders (for Rubrics & Question Scoring)
                 return (
                     <div className="overflow-x-auto mb-6">
                         <table className="w-full border-collapse border border-gray-300" {...props}>
@@ -68,18 +76,21 @@ const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({ content }) => {
             th({ children, ...props }) {
                  const text = String(children); 
                  const isLayoutHeader = text.includes("KHOA") || text.includes("BỘ MÔN");
+                 const isSig = text.includes("CÁN BỘ CHẤM THI") || text.includes("GIÁM KHẢO");
                  
                  if (isLayoutHeader) {
-                     // Header Layout Table Cell
-                     // Padding 0 for left side to prevent indentation
-                     return <th className="p-1 text-left align-top font-normal border-none" {...props}>{children}</th>
+                     return <th className="p-1 text-left align-top font-normal border-none" {...props}>{children}</th>;
+                 }
+
+                 if (isSig) {
+                     return <th className="p-3 text-center align-top font-bold border-none" {...props}>{children}</th>;
                  }
                  
                  // Standard Answer Key Header
-                 return <th className="border border-gray-300 bg-gray-100 p-2 text-left font-bold" {...props}>{children}</th>
+                 return <th className="border border-gray-300 bg-gray-100 p-2 text-left font-bold" {...props}>{children}</th>;
             },
             td({ children, ...props }) {
-                return <td className="border border-gray-300 p-2 align-top" {...props}>{children}</td>
+                 return <td className="border border-gray-300 p-2 align-top" {...props}>{children}</td>;
             }
         }}
       >

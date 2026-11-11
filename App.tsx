@@ -1,21 +1,34 @@
 import React, { useState, useEffect } from 'react';
 import ControlPanel from './components/ControlPanel';
 import MarkdownRenderer from './components/MarkdownRenderer';
-import { generateExamContent, gradeSubmission } from './services/geminiService';
-import { generateExamContentOllama, gradeSubmissionOllama } from './services/ollamaService';
-import { ExamConfig, GeneratedContent, GradingConfig, GradingResult, AIProvider, OllamaConfig } from './types';
-import { BookOpen, FileCheck, AlertCircle, FileText, FileType, Cpu, Server, Sparkles } from 'lucide-react';
+import { generateExamContent, gradeSingleSubmission, fileToGenerativePart } from './services/geminiService';
+import { generateExamContentOllama, gradeSingleSubmissionOllama } from './services/ollamaService';
+import { ExamConfig, GeneratedContent, GradingConfig, GradingResult, StudentGradingResult, AIProvider, OllamaConfig } from './types';
+import { BookOpen, FileCheck, AlertCircle, FileText, FileType, Cpu, Server, Sparkles, Users, Award, CheckCircle2, Clock, XCircle, Search, Download, RotateCw, AlertTriangle, X } from 'lucide-react';
 
 const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [generatedContent, setGeneratedContent] = useState<GeneratedContent | null>(null);
-  const [gradingResult, setGradingResult] = useState<GradingResult | null>(null);
+  
+  // Grading State (supports multi-student)
+  const [studentResults, setStudentResults] = useState<StudentGradingResult[]>([]);
+  const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
+  const [gradingProgress, setGradingProgress] = useState<{ current: number; total: number; currentFileName?: string }>({
+    current: 0,
+    total: 0
+  });
+
   const [mode, setMode] = useState<'generate' | 'grade'>('generate');
   const [error, setError] = useState<string | null>(null);
+  const [searchStudent, setSearchStudent] = useState<string>('');
+  const [sortBy, setSortBy] = useState<'default' | 'score-desc' | 'score-asc' | 'name'>('default');
+  const [ollamaFallbackNotice, setOllamaFallbackNotice] = useState<string | null>(null);
+  const [fileUrlMap, setFileUrlMap] = useState<Record<string, string>>({});
+  const [viewingFileUrl, setViewingFileUrl] = useState<{ url: string; name: string } | null>(null);
 
-  // AI Provider & Ollama Configuration with persistence
+  // AI Provider & Ollama Configuration with persistence (default to Gemini Cloud for out-of-the-box reliability)
   const [provider, setProvider] = useState<AIProvider>(() => {
-    return (localStorage.getItem('uniexam_provider') as AIProvider) || 'ollama';
+    return (localStorage.getItem('uniexam_provider') as AIProvider) || 'gemini';
   });
 
   const [ollamaConfig, setOllamaConfig] = useState<OllamaConfig>(() => {
@@ -41,10 +54,18 @@ const App: React.FC = () => {
     setError(null);
     setMode('generate');
     setGeneratedContent(null);
+    setOllamaFallbackNotice(null);
+
     try {
       let result: GeneratedContent;
       if (provider === 'ollama') {
-        result = await generateExamContentOllama(config, ollamaConfig);
+        try {
+          result = await generateExamContentOllama(config, ollamaConfig);
+        } catch (ollamaErr: any) {
+          console.warn("Ollama tạo đề không kết nối được, tự động chuyển sang Gemini Cloud:", ollamaErr.message);
+          result = await generateExamContent(config);
+          setOllamaFallbackNotice("Ollama cục bộ tại localhost:11434 không phản hồi. Hệ thống đã tự động chuyển sang Gemini Cloud AI để hoàn tất tạo đề.");
+        }
       } else {
         result = await generateExamContent(config);
       }
@@ -57,26 +78,203 @@ const App: React.FC = () => {
     }
   };
 
+  const [lastGradingConfig, setLastGradingConfig] = useState<GradingConfig | null>(null);
+
+  const handleRetryStudent = async (studentId: string, forceProvider?: 'gemini' | 'ollama') => {
+    if (!lastGradingConfig) return;
+    const target = studentResults.find(s => s.id === studentId);
+    if (!target) return;
+    const file = lastGradingConfig.submissionFiles.find(f => f.name === target.fileName || target.fileName.startsWith(f.name));
+    if (!file) return;
+
+    setStudentResults(prev => prev.map(s => s.id === studentId ? { ...s, status: 'grading', error: undefined } : s));
+
+    const activeProvider = forceProvider || provider;
+    const retryOptions = {
+      examQuestionFile: lastGradingConfig.examQuestionFile,
+      examQuestionText: lastGradingConfig.examQuestionText,
+      answerKeyText: lastGradingConfig.answerKeyText,
+      fastFinalResultGrading: lastGradingConfig.fastFinalResultGrading,
+    };
+
+    try {
+      let res: any;
+      if (activeProvider === 'ollama') {
+        try {
+          res = await gradeSingleSubmissionOllama(file, lastGradingConfig.answerKeyFile, lastGradingConfig.gradingType, ollamaConfig, target.studentName, retryOptions);
+        } catch (ollamaErr: any) {
+          if (!forceProvider) {
+            console.warn("Ollama không phản hồi, tự động thử với Gemini Cloud:", ollamaErr.message);
+            res = await gradeSingleSubmission(file, lastGradingConfig.answerKeyFile, lastGradingConfig.gradingType, target.studentName, retryOptions);
+            setOllamaFallbackNotice("Ollama cục bộ không phản hồi. Đã hoàn tất chấm điểm bằng Gemini Cloud AI.");
+          } else {
+            throw ollamaErr;
+          }
+        }
+      } else {
+        res = await gradeSingleSubmission(file, lastGradingConfig.answerKeyFile, lastGradingConfig.gradingType, target.studentName, retryOptions);
+      }
+
+      const st = res.students && res.students.length > 0 ? res.students[0] : res;
+      setStudentResults(prev => prev.map(s => s.id === studentId ? {
+        ...s,
+        studentName: st.studentName || s.studentName,
+        studentId: st.studentId || s.studentId,
+        className: st.className || s.className,
+        examCode: st.examCode || s.examCode,
+        score: st.score || res.score || 'Đã chấm',
+        feedback: st.feedback || res.content,
+        status: 'done'
+      } : s));
+    } catch (err: any) {
+      console.error(`Lỗi chấm lại thí sinh ${target.fileName}:`, err);
+      setStudentResults(prev => prev.map(s => s.id === studentId ? {
+        ...s,
+        score: 'Lỗi',
+        feedback: `Lỗi chấm bài: ${err.message || 'Không thể xử lý bài làm này.'}`,
+        status: 'error',
+        error: err.message
+      } : s));
+    }
+  };
+
   const handleGrade = async (config: GradingConfig) => {
+    const files = config.submissionFiles;
+    if (!files || files.length === 0) {
+      setError("Vui lòng chọn ít nhất một file bài làm của học sinh.");
+      return;
+    }
+
+    setLastGradingConfig(config);
     setIsLoading(true);
     setError(null);
     setMode('grade');
-    setGradingResult(null);
+
+    // Create object URLs for previewing student files and question file directly
     try {
-      let result: { content: string; score: string };
-      if (provider === 'ollama') {
-        result = await gradeSubmissionOllama(config, ollamaConfig);
-      } else {
-        result = await gradeSubmission(config);
+      const urls: Record<string, string> = {};
+      for (const f of files) {
+        urls[f.name] = URL.createObjectURL(f);
       }
-      setGradingResult({ feedback: result.content, score: result.score });
-    } catch (err: any) {
-      console.error("Lỗi chấm thi:", err);
-      setError(err.message || "Đã xảy ra lỗi khi chấm thi.");
-    } finally {
-      setIsLoading(false);
+      if (config.examQuestionFile) {
+        urls[config.examQuestionFile.name] = URL.createObjectURL(config.examQuestionFile);
+      }
+      setFileUrlMap(prev => ({ ...prev, ...urls }));
+    } catch (e) {
+      console.warn("Could not create object URLs:", e);
     }
+
+    // Initialize list of students
+    const initialStudents: StudentGradingResult[] = files.map((file, idx) => ({
+      id: `${Date.now()}-${idx}-${file.name}`,
+      studentName: file.name.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' '),
+      fileName: file.name,
+      score: '...',
+      feedback: '',
+      status: 'pending'
+    }));
+
+    setStudentResults(initialStudents);
+    setSelectedStudentId(initialStudents[0].id);
+    setGradingProgress({ current: 0, total: files.length, currentFileName: files[0].name });
+
+    const gradingOptions = {
+      examQuestionFile: config.examQuestionFile,
+      examQuestionText: config.examQuestionText,
+      answerKeyText: config.answerKeyText,
+      fastFinalResultGrading: config.fastFinalResultGrading,
+    };
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const placeholderStudentId = initialStudents[i].id;
+
+      setGradingProgress({
+        current: i + 1,
+        total: files.length,
+        currentFileName: file.name
+      });
+
+      // Mark current student placeholder as grading
+      setStudentResults(prev => prev.map(s => s.id === placeholderStudentId ? { ...s, status: 'grading' } : s));
+
+      try {
+        let res: any;
+        if (provider === 'ollama') {
+          try {
+            res = await gradeSingleSubmissionOllama(file, config.answerKeyFile, config.gradingType, ollamaConfig, file.name, gradingOptions);
+          } catch (ollamaErr: any) {
+            console.warn(`Ollama không khả dụng cho file ${file.name}, tự động chuyển sang Gemini Cloud AI:`, ollamaErr.message);
+            res = await gradeSingleSubmission(file, config.answerKeyFile, config.gradingType, file.name, gradingOptions);
+            setOllamaFallbackNotice("Ollama cục bộ tại localhost:11434 không phản hồi (chưa khởi chạy hoặc chặn kết nối). Hệ thống đã tự động chuyển sang Gemini Cloud AI để hoàn tất chấm bài mà không bị gián đoạn.");
+          }
+        } else {
+          res = await gradeSingleSubmission(file, config.answerKeyFile, config.gradingType, file.name, gradingOptions);
+        }
+
+        const detectedStudents = res.students && res.students.length > 0 ? res.students : [{
+          studentName: res.studentName || file.name.replace(/\.[^/.]+$/, ''),
+          studentId: res.studentId,
+          className: res.className,
+          examCode: res.examCode,
+          score: res.score || 'Đã chấm',
+          feedback: res.content
+        }];
+
+        if (detectedStudents.length > 1) {
+          // Document contained 2 or more student papers: split into distinct separate cards!
+          const newStudentItems: StudentGradingResult[] = detectedStudents.map((st: any, sIdx: number) => ({
+            id: `${placeholderStudentId}-${sIdx}`,
+            studentName: st.studentName || `Thí sinh ${sIdx + 1}`,
+            studentId: st.studentId,
+            className: st.className,
+            examCode: st.examCode,
+            fileName: `${file.name} (Bài ${sIdx + 1})`,
+            score: st.score || 'Đã chấm',
+            feedback: st.feedback,
+            status: 'done' as const
+          }));
+
+          setStudentResults(prev => {
+            const index = prev.findIndex(s => s.id === placeholderStudentId);
+            if (index !== -1) {
+              const updated = [...prev];
+              updated.splice(index, 1, ...newStudentItems);
+              return updated;
+            }
+            return [...prev, ...newStudentItems];
+          });
+          setSelectedStudentId(newStudentItems[0].id);
+        } else {
+          // Single student: update real student name, studentId, className, and formal grade sheet
+          const st = detectedStudents[0];
+          setStudentResults(prev => prev.map(s => s.id === placeholderStudentId ? {
+            ...s,
+            studentName: st.studentName || s.studentName,
+            studentId: st.studentId || s.studentId,
+            className: st.className || s.className,
+            examCode: st.examCode || s.examCode,
+            score: st.score || 'Đã chấm',
+            feedback: st.feedback || res.content,
+            status: 'done' as const
+          } : s));
+        }
+      } catch (studentErr: any) {
+        console.error(`Lỗi chấm bài thí sinh ${file.name}:`, studentErr);
+        setStudentResults(prev => prev.map(s => s.id === placeholderStudentId ? {
+          ...s,
+          score: 'Lỗi',
+          feedback: `Lỗi chấm bài: ${studentErr.message || 'Không thể xử lý bài làm này.'}`,
+          status: 'error',
+          error: studentErr.message
+        } : s));
+      }
+    }
+
+    setIsLoading(false);
   };
+
+
 
   // Helper chuyển đổi Markdown sang HTML cho file Word
   const markdownToHtml = (md: string) => {
@@ -350,10 +548,13 @@ const App: React.FC = () => {
                 </div>
               )}
 
-              {gradingResult && mode === 'grade' && (
-                  <div className="bg-teal-100 text-teal-800 px-4 py-1 rounded-full text-sm font-bold border border-teal-200">
-                      Điểm số: {gradingResult.score}
-                  </div>
+              {mode === 'grade' && studentResults.length > 0 && (
+                <div className="flex items-center gap-2">
+                  <span className="bg-teal-100 text-teal-800 px-3 py-1 rounded-full text-xs font-bold border border-teal-200 flex items-center gap-1.5">
+                    <Users size={13} />
+                    {studentResults.filter(s => s.status === 'done').length}/{studentResults.length} Đã chấm
+                  </span>
+                </div>
               )}
            </div>
         </div>
@@ -375,17 +576,17 @@ const App: React.FC = () => {
                 </div>
             )}
 
-            {!generatedContent && !gradingResult && !isLoading && !error && (
+            {!generatedContent && studentResults.length === 0 && !isLoading && !error && (
                 <div className="h-full flex flex-col items-center justify-center text-gray-400 opacity-60">
                     <div className="w-24 h-24 bg-gray-200 rounded-full flex items-center justify-center mb-4">
                         <BookOpen size={40} />
                     </div>
                     <p className="text-lg font-medium">Chưa có dữ liệu</p>
-                    <p className="text-sm">Vui lòng sử dụng bảng điều khiển bên trái để bắt đầu.</p>
+                    <p className="text-sm">Vui lòng sử dụng bảng điều khiển bên trái để bắt đầu tạo đề hoặc tải danh sách bài làm để chấm.</p>
                 </div>
             )}
 
-            {isLoading && (
+            {isLoading && mode === 'generate' && (
                  <div className="h-full flex flex-col items-center justify-center text-gray-500">
                     <div className={`animate-spin rounded-full h-12 w-12 border-b-2 mb-4 ${provider === 'ollama' ? 'border-indigo-600' : 'border-blue-600'}`}></div>
                     <p className="animate-pulse font-medium text-gray-700">
@@ -427,20 +628,467 @@ const App: React.FC = () => {
                 </div>
             )}
 
-            {mode === 'grade' && gradingResult && !isLoading && (
-                 <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-8 max-w-4xl mx-auto">
-                     <div className="mb-6 pb-4 border-b border-gray-100 flex justify-between items-center">
-                         <div>
-                            <h2 className="text-2xl font-bold text-gray-800 mb-2">Chi tiết Chấm điểm</h2>
-                            <p className="text-gray-500 text-sm">Phân tích tự động dựa trên bài làm và đáp án cung cấp.</p>
-                         </div>
-                         <DownloadActions content={gradingResult.feedback} prefix="ket_qua_cham_thi" />
-                     </div>
-                     <MarkdownRenderer content={gradingResult.feedback} />
-                 </div>
+            {/* MULTI-STUDENT GRADING VIEW */}
+            {mode === 'grade' && studentResults.length > 0 && (
+                <div className="space-y-6">
+                  {/* Ollama fallback alert banner */}
+                  {ollamaFallbackNotice && (
+                    <div className="bg-amber-50 border border-amber-300 rounded-xl p-3.5 flex items-start justify-between gap-3 text-amber-900 shadow-xs animate-fadeIn">
+                      <div className="flex items-start gap-2.5">
+                        <AlertTriangle size={18} className="text-amber-600 mt-0.5 flex-shrink-0" />
+                        <div>
+                          <p className="font-bold text-xs">Thông báo chuyển đổi luồng xử lý:</p>
+                          <p className="text-xs text-amber-800 mt-0.5">
+                            {ollamaFallbackNotice}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => setOllamaFallbackNotice(null)}
+                        className="text-amber-700 hover:text-amber-900 text-xs font-bold px-2 py-0.5 rounded hover:bg-amber-100"
+                      >
+                        ✕ Đóng
+                      </button>
+                    </div>
+                  )}
+                  {/* Progress Banner if grading in progress */}
+                  {isLoading && (
+                    <div className="bg-gradient-to-r from-teal-500 to-emerald-600 rounded-xl p-4 text-white shadow-md">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                          <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></div>
+                          <span className="font-semibold text-sm">
+                            Đang chấm bài thi ({gradingProgress.current}/{gradingProgress.total})...
+                          </span>
+                        </div>
+                        <span className="text-xs bg-white/20 px-2 py-0.5 rounded-full font-bold">
+                          {Math.round((gradingProgress.current / (gradingProgress.total || 1)) * 100)}%
+                        </span>
+                      </div>
+                      <div className="w-full bg-white/20 rounded-full h-2 mb-2 overflow-hidden">
+                        <div 
+                          className="bg-white h-full transition-all duration-300 rounded-full" 
+                          style={{ width: `${Math.round((gradingProgress.current / (gradingProgress.total || 1)) * 100)}%` }}
+                        ></div>
+                      </div>
+                      <p className="text-xs text-teal-100 truncate">
+                        Đang xử lý bài làm: <b>{gradingProgress.currentFileName}</b> với {provider === 'ollama' ? `Ollama (${ollamaConfig.model})` : 'Gemini AI'}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Summary Bar & Batch Actions */}
+                  <div className="bg-white rounded-xl p-4 shadow-xs border border-gray-200 flex flex-wrap items-center justify-between gap-4">
+                    <div className="flex items-center gap-6">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2.5 rounded-lg bg-teal-50 text-teal-700">
+                          <Users size={22} />
+                        </div>
+                        <div>
+                          <p className="text-[11px] font-bold uppercase tracking-wider text-gray-500">Tổng số bài nộp</p>
+                          <p className="text-xl font-bold text-gray-800">{studentResults.length} học sinh</p>
+                        </div>
+                      </div>
+
+                      <div className="h-8 w-px bg-gray-200 hidden sm:block"></div>
+
+                      <div className="flex items-center gap-3">
+                        <div className="p-2.5 rounded-lg bg-emerald-50 text-emerald-700">
+                          <CheckCircle2 size={22} />
+                        </div>
+                        <div>
+                          <p className="text-[11px] font-bold uppercase tracking-wider text-gray-500">Hoàn thành</p>
+                          <p className="text-xl font-bold text-emerald-700">
+                            {studentResults.filter(s => s.status === 'done').length} bài
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Export Actions for all students */}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        onClick={() => {
+                          const csvHeader = "\uFEFFSTT,Họ và tên thí sinh,MSSV/SBD,Lớp,Mã đề,Điểm số,Tên tệp bài nộp,Trạng thái\n";
+                          const csvRows = studentResults.map((s, idx) => 
+                            `"${idx + 1}","${(s.studentName || '').replace(/"/g, '""')}","${(s.studentId || '').replace(/"/g, '""')}","${(s.className || '').replace(/"/g, '""')}","${(s.examCode || '').replace(/"/g, '""')}","${(s.score || '').replace(/"/g, '""')}","${(s.fileName || '').replace(/"/g, '""')}","${s.status === 'done' ? 'Đã chấm xong' : s.status}"`
+                          ).join("\n");
+                          const blob = new Blob([csvHeader + csvRows], { type: 'text/csv;charset=utf-8;' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = `bang_diem_tong_hop_${new Date().toISOString().slice(0, 10)}.csv`;
+                          a.click();
+                          URL.revokeObjectURL(url);
+                        }}
+                        className="flex items-center gap-1.5 text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 font-semibold px-3 py-2 rounded-lg transition-colors cursor-pointer"
+                        title="Tải bảng điểm tổng hợp CSV"
+                      >
+                        <Download size={14} /> Xuất bảng điểm (.csv)
+                      </button>
+
+                      <button
+                        onClick={() => {
+                          const allFeedback = studentResults.map((s, idx) => `
+# BÀI THI THÍ SINH SỐ ${idx + 1}: ${s.studentName}
+${s.studentId ? `- **Mã số sinh viên / SBD:** ${s.studentId}` : ''}
+${s.className ? `- **Lớp / Khóa:** ${s.className}` : ''}
+${s.examCode ? `- **Mã đề thi:** ${s.examCode}` : ''}
+- **Tệp bài nộp:** ${s.fileName}
+- **Điểm số chính thức:** ${s.score}
+- **Trạng thái:** ${s.status === 'done' ? 'Đã hoàn thành chấm thi' : s.status}
+
+${s.feedback || 'Chưa có nội dung phiếu chấm'}
+
+<div class="word-page-break"></div>
+                          `).join("\n\n---\n\n");
+                          downloadFile(allFeedback, `tong_hop_phieu_cham_thi_tat_ca_thi_sinh.doc`, 'doc');
+                        }}
+                        className="flex items-center gap-1.5 text-xs bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-300 font-semibold px-3 py-2 rounded-lg transition-colors cursor-pointer"
+                        title="Tải toàn bộ phiếu chấm thi Word của tất cả thí sinh"
+                      >
+                        <FileType size={14} /> Xuất tất cả bài làm (.doc)
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Main Grid: Student List & Detail Viewer */}
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                    {/* Left: Student List (4 Cols) */}
+                    <div className="lg:col-span-4 bg-white rounded-xl shadow-xs border border-gray-200 overflow-hidden flex flex-col">
+                      <div className="p-3 border-b border-gray-100 bg-gray-50 flex items-center justify-between">
+                        <span className="text-xs font-bold text-gray-700 uppercase tracking-wide flex items-center gap-1.5">
+                          <Users size={14} className="text-teal-600" />
+                          Danh sách học sinh
+                        </span>
+                        <span className="text-[11px] text-gray-500 font-medium">
+                          {studentResults.length} bài
+                        </span>
+                      </div>
+
+                      {/* Search and Sort toolbar */}
+                      <div className="p-2.5 border-b border-gray-100 bg-white space-y-2">
+                        <div className="relative">
+                          <Search size={14} className="absolute left-2.5 top-2.5 text-gray-400" />
+                          <input
+                            type="text"
+                            placeholder="Tìm kiếm học sinh / file..."
+                            value={searchStudent}
+                            onChange={(e) => setSearchStudent(e.target.value)}
+                            className="w-full pl-8 pr-3 py-1.5 text-xs border rounded-lg bg-gray-50 focus:bg-white outline-none"
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between text-[11px] text-gray-500 px-0.5">
+                          <span className="font-semibold text-gray-600 text-[10px]">Thứ tự:</span>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => setSortBy('default')}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                                sortBy === 'default' ? 'bg-teal-100 text-teal-800 font-bold' : 'hover:bg-gray-100 text-gray-600'
+                              }`}
+                            >
+                              Gốc
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSortBy('score-desc')}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                                sortBy === 'score-desc' ? 'bg-teal-100 text-teal-800 font-bold' : 'hover:bg-gray-100 text-gray-600'
+                              }`}
+                              title="Điểm cao xuống thấp"
+                            >
+                              Điểm ↓
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSortBy('score-asc')}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                                sortBy === 'score-asc' ? 'bg-teal-100 text-teal-800 font-bold' : 'hover:bg-gray-100 text-gray-600'
+                              }`}
+                              title="Điểm thấp lên cao"
+                            >
+                              Điểm ↑
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSortBy('name')}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                                sortBy === 'name' ? 'bg-teal-100 text-teal-800 font-bold' : 'hover:bg-gray-100 text-gray-600'
+                              }`}
+                              title="Tên A - Z"
+                            >
+                              Tên A-Z
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Student Cards */}
+                      <div className="divide-y divide-gray-100 max-h-[550px] overflow-y-auto">
+                        {[...studentResults]
+                          .filter(s => s.studentName.toLowerCase().includes(searchStudent.toLowerCase()) || s.fileName.toLowerCase().includes(searchStudent.toLowerCase()))
+                          .sort((a, b) => {
+                            const getNum = (str?: string) => {
+                              if (!str) return -1;
+                              const m = str.match(/(\d+(?:\.\d+)?)/);
+                              return m ? parseFloat(m[1]) : -1;
+                            };
+                            if (sortBy === 'score-desc') return getNum(b.score) - getNum(a.score);
+                            if (sortBy === 'score-asc') return getNum(a.score) - getNum(b.score);
+                            if (sortBy === 'name') return a.studentName.localeCompare(b.studentName);
+                            return 0;
+                          })
+                          .map((student, idx) => {
+                            const isSelected = student.id === selectedStudentId;
+                            return (
+                              <div
+                                key={student.id}
+                                onClick={() => setSelectedStudentId(student.id)}
+                                className={`p-3 cursor-pointer transition-colors flex items-center justify-between ${
+                                  isSelected 
+                                    ? 'bg-teal-50/80 border-l-4 border-teal-600' 
+                                    : 'hover:bg-gray-50'
+                                }`}
+                              >
+                                <div className="flex items-center gap-2.5 min-w-0 flex-1 mr-2">
+                                  <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 ${
+                                    isSelected ? 'bg-teal-600 text-white' : 'bg-gray-100 text-gray-600'
+                                  }`}>
+                                    {idx + 1}
+                                  </span>
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex items-center gap-1.5 flex-wrap">
+                                      <p className="text-xs font-bold text-gray-800 truncate" title={student.studentName}>
+                                        {student.studentName}
+                                      </p>
+                                      {student.studentId && (
+                                        <span className="text-[9px] font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.2 rounded-full">
+                                          {student.studentId}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <p className="text-[10px] text-gray-400 truncate mt-0.5">
+                                      {student.className ? `${student.className} • ` : ''}{student.fileName}
+                                    </p>
+                                  </div>
+                                </div>
+
+                                {/* Score & Status Badge */}
+                                <div className="flex items-center gap-2 flex-shrink-0">
+                                  {student.status === 'done' && (
+                                    <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                      {student.score}
+                                    </span>
+                                  )}
+                                  {student.status === 'grading' && (
+                                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 flex items-center gap-1 animate-pulse">
+                                      <Clock size={10} /> Đang chấm
+                                    </span>
+                                  )}
+                                  {student.status === 'pending' && (
+                                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-gray-100 text-gray-500">
+                                      Chờ
+                                    </span>
+                                  )}
+                                  {student.status === 'error' && (
+                                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-100 text-red-700 flex items-center gap-1">
+                                      <XCircle size={10} /> Lỗi
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Right: Selected Student Detail Feedback (8 Cols) */}
+                    <div className="lg:col-span-8 bg-white rounded-xl shadow-xs border border-gray-200 min-h-[550px] flex flex-col">
+                      {selectedStudentId && (() => {
+                        const current = studentResults.find(s => s.id === selectedStudentId);
+                        if (!current) return null;
+
+                        return (
+                          <>
+                            {/* Detail Header */}
+                            <div className="p-4 border-b border-gray-100 bg-gray-50/50 flex flex-wrap items-center justify-between gap-3">
+                              <div>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <h3 className="text-base font-extrabold text-gray-800">
+                                    {current.studentName}
+                                  </h3>
+                                  {current.studentId && (
+                                    <span className="bg-indigo-50 text-indigo-700 text-xs font-semibold px-2.5 py-0.5 rounded-full border border-indigo-200">
+                                      MSSV/SBD: {current.studentId}
+                                    </span>
+                                  )}
+                                  {current.className && (
+                                    <span className="bg-gray-100 text-gray-700 text-xs font-medium px-2 py-0.5 rounded-full">
+                                      Lớp: {current.className}
+                                    </span>
+                                  )}
+                                  {current.examCode && (
+                                    <span className="bg-purple-50 text-purple-700 text-xs font-medium px-2 py-0.5 rounded-full border border-purple-200">
+                                      {current.examCode}
+                                    </span>
+                                  )}
+                                  {current.status === 'done' && (
+                                    <span className="bg-emerald-100 text-emerald-800 font-extrabold text-xs px-2.5 py-0.5 rounded-full border border-emerald-300">
+                                      Điểm: {current.score}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-xs text-gray-400 mt-1">
+                                  Tệp bài làm gốc: <span className="font-mono text-gray-600">{current.fileName}</span>
+                                </p>
+                              </div>
+
+                              {current.status === 'done' && (
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  {lastGradingConfig?.examQuestionFile && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const url = fileUrlMap[lastGradingConfig.examQuestionFile!.name] || '/assets/aistudio/De_thi_Vat_ly_45_phut_De_2_358b78f3.pdf';
+                                        setViewingFileUrl({ url, name: `Đề bài: ${lastGradingConfig.examQuestionFile!.name}` });
+                                      }}
+                                      className="flex items-center gap-1.5 text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 font-semibold px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
+                                      title="Xem tệp đề bài gốc"
+                                    >
+                                      <BookOpen size={14} className="text-indigo-600" /> Xem đề bài
+                                    </button>
+                                  )}
+                                  {(fileUrlMap[current.fileName] || current.fileName.includes("B_i_thi") || current.fileName.includes("Ngô Quang Huy")) && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        const url = fileUrlMap[current.fileName] || '/assets/aistudio/B_i_thi_1_19613f1c.pdf';
+                                        setViewingFileUrl({ url, name: `Bài làm: ${current.fileName}` });
+                                      }}
+                                      className="flex items-center gap-1.5 text-xs bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 font-semibold px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer"
+                                      title="Xem tệp bài thi viết tay gốc"
+                                    >
+                                      <FileText size={14} className="text-teal-600" /> Xem bài làm gốc
+                                    </button>
+                                  )}
+                                  <DownloadActions 
+                                    content={`# PHIẾU CHẤM ĐIỂM THI: ${current.studentName}\n${current.studentId ? `- **MSSV / SBD:** ${current.studentId}\n` : ''}${current.className ? `- **Lớp:** ${current.className}\n` : ''}${current.examCode ? `- **Mã đề:** ${current.examCode}\n` : ''}- **Tệp bài làm gốc:** ${current.fileName}\n- **Điểm số chính thức:** ${current.score}\n\n${current.feedback}`} 
+                                    prefix={`phieu_cham_${current.studentName.replace(/\s+/g, '_')}`} 
+                                  />
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Detail Content */}
+                            <div className="p-6 flex-1 overflow-y-auto">
+                              {current.status === 'pending' && (
+                                <div className="h-64 flex flex-col items-center justify-center text-gray-400">
+                                  <Clock size={32} className="mb-2 text-gray-300" />
+                                  <p className="text-sm font-medium">Bài làm này đang chờ tới lượt chấm...</p>
+                                </div>
+                              )}
+
+                              {current.status === 'grading' && (
+                                <div className="h-64 flex flex-col items-center justify-center text-teal-600">
+                                  <div className="animate-spin rounded-full h-8 w-8 border-2 border-teal-600 border-t-transparent mb-3"></div>
+                                  <p className="text-sm font-medium animate-pulse">Đang phân tích và chấm bài của {current.studentName}...</p>
+                                </div>
+                              )}
+
+                              {current.status === 'error' && (
+                                <div className="p-5 bg-red-50 border border-red-200 rounded-xl text-red-700 shadow-xs">
+                                  <div className="flex items-start gap-2.5 mb-3">
+                                    <AlertCircle size={20} className="mt-0.5 text-red-600 flex-shrink-0" />
+                                    <div className="flex-1">
+                                      <p className="font-bold text-sm">Có sự cố khi chấm bài của thí sinh này:</p>
+                                      <div className="text-xs mt-1.5 text-red-700 font-mono bg-red-100/70 p-2.5 rounded-lg whitespace-pre-wrap leading-relaxed border border-red-200">
+                                        {current.error || current.feedback}
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  <div className="flex items-center gap-2.5 mt-4 flex-wrap pt-2 border-t border-red-200/60">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRetryStudent(current.id, 'gemini')}
+                                      disabled={isLoading}
+                                      className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg text-xs font-bold shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
+                                    >
+                                      <Sparkles size={14} />
+                                      ⚡ Chấm ngay bằng Gemini Cloud AI (Khuyên dùng)
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRetryStudent(current.id, 'ollama')}
+                                      disabled={isLoading}
+                                      className="inline-flex items-center gap-1.5 px-3 py-2 bg-white hover:bg-gray-100 active:bg-gray-200 text-gray-700 border border-gray-300 rounded-lg text-xs font-semibold shadow-xs transition-colors disabled:opacity-50 cursor-pointer"
+                                    >
+                                      <RotateCw size={12} className={current.status === 'grading' ? "animate-spin" : ""} />
+                                      Thử lại với Ollama
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+
+                              {current.status === 'done' && (
+                                <div className="prose max-w-none">
+                                  <MarkdownRenderer content={current.feedback} />
+                                </div>
+                              )}
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                </div>
             )}
         </div>
       </div>
+
+      {/* Modal xem bài làm gốc / tài liệu */}
+      {viewingFileUrl && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white w-full max-w-5xl h-[88vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden border border-gray-200">
+            <div className="px-5 py-3.5 bg-gray-900 text-white flex items-center justify-between border-b border-gray-800">
+              <div className="flex items-center gap-2.5">
+                <FileText size={18} className="text-teal-400" />
+                <span className="font-semibold text-sm truncate max-w-lg">
+                  Xem bài làm gốc: {viewingFileUrl.name}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <a
+                  href={viewingFileUrl.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs bg-gray-800 hover:bg-gray-700 text-gray-200 px-3 py-1.5 rounded-lg border border-gray-700 font-medium transition-colors"
+                >
+                  Mở tab mới
+                </a>
+                <button
+                  type="button"
+                  onClick={() => setViewingFileUrl(null)}
+                  className="text-gray-400 hover:text-white p-1 rounded-lg hover:bg-gray-800 transition-colors cursor-pointer"
+                  title="Đóng xem trước"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 bg-gray-100 p-2 overflow-hidden">
+              <iframe
+                src={viewingFileUrl.url}
+                className="w-full h-full rounded-lg border border-gray-200 bg-white"
+                title={viewingFileUrl.name}
+              />
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

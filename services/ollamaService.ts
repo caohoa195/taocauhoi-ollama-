@@ -1,4 +1,5 @@
 import { ExamConfig, GradingConfig, GeneratedContent, DifficultyLevel, QuestionType, OllamaConfig } from "../types";
+import { extractFileContent } from "./fileUtils";
 
 export interface OllamaConnectionResult {
   ok: boolean;
@@ -7,37 +8,6 @@ export interface OllamaConnectionResult {
   source?: 'browser' | 'proxy';
 }
 
-// Convert File to base64
-const fileToBase64 = (file: File): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const result = reader.result as string;
-      const base64 = result.includes(',') ? result.split(',')[1] : result;
-      resolve(base64);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-};
-
-// Check if file is text/readable
-const tryReadAsText = async (file: File): Promise<string | null> => {
-  if (
-    file.type.startsWith('text/') ||
-    file.name.endsWith('.txt') ||
-    file.name.endsWith('.md') ||
-    file.name.endsWith('.json') ||
-    file.name.endsWith('.csv')
-  ) {
-    try {
-      return await file.text();
-    } catch {
-      return null;
-    }
-  }
-  return null;
-};
 
 // Test connection to Ollama
 export const checkOllamaConnection = async (
@@ -95,15 +65,21 @@ const callOllamaApi = async (
   endpoint: '/api/chat' | '/api/generate',
   body: any
 ): Promise<any> => {
-  const cleanUrl = ollamaConfig.baseUrl.replace(/\/+$/, '');
+  const cleanUrl = (ollamaConfig.baseUrl || 'http://localhost:11434').replace(/\/+$/, '');
+  const isLocalhost = cleanUrl.includes('localhost') || cleanUrl.includes('127.0.0.1');
 
-  if (ollamaConfig.connectionMode === 'browser') {
+  // For localhost, browser direct connection is the only path because cloud server cannot reach user's 127.0.0.1
+  if (ollamaConfig.connectionMode === 'browser' || isLocalhost) {
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 min
       const response = await fetch(`${cleanUrl}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
+      clearTimeout(timeoutId);
 
       if (!response.ok) {
         const errorText = await response.text();
@@ -112,12 +88,18 @@ const callOllamaApi = async (
 
       return await response.json();
     } catch (err: any) {
-      console.warn("Browser call failed, trying proxy fallback...", err);
-      // Fallback to proxy
+      console.warn("Direct browser call to Ollama failed:", err);
+      if (isLocalhost) {
+        throw new Error(
+          `Không thể kết nối đến Ollama trên máy tính của bạn tại ${cleanUrl}.\n` +
+          `Nguyên nhân: Ứng dụng Ollama chưa được mở hoặc trình duyệt chặn kết nối CORS.\n` +
+          `Khắc phục: Mở Terminal gõ 'OLLAMA_ORIGINS="*" ollama serve', hoặc chuyển sang dùng 'Gemini Cloud' để chấm ngay lập tức.`
+        );
+      }
     }
   }
 
-  // Call via backend proxy
+  // Call via backend proxy (only suitable for remote servers / tunnels / ngrok)
   const proxyRes = await fetch('/api/ollama/call', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -130,7 +112,7 @@ const callOllamaApi = async (
 
   if (!proxyRes.ok) {
     const errJson = await proxyRes.json().catch(() => ({}));
-    throw new Error(errJson.error || `Lỗi khi gọi Ollama qua proxy (${proxyRes.status})`);
+    throw new Error(errJson.error || `Lỗi khi gọi Ollama (${proxyRes.status})`);
   }
 
   return await proxyRes.json();
@@ -146,15 +128,15 @@ export const generateExamContentOllama = async (
 
   if (config.sourceFiles && config.sourceFiles.length > 0) {
     for (const file of config.sourceFiles) {
-      const textContent = await tryReadAsText(file);
-      if (textContent) {
-        attachedText += `\n--- Tài liệu đính kèm: ${file.name} ---\n${textContent}\n`;
-      } else if (file.type.startsWith('image/')) {
-        const b64 = await fileToBase64(file);
-        images.push(b64);
+      const extracted = await extractFileContent(file);
+      if (extracted.type === 'text' && extracted.text) {
+        attachedText += `\n--- Tài liệu đính kèm: ${file.name} ---\n${extracted.text}\n`;
+      } else if (extracted.type === 'image' && extracted.base64) {
+        images.push(extracted.base64);
+      } else if (extracted.text) {
+        attachedText += `\n--- Tài liệu đính kèm: ${file.name} ---\n${extracted.text}\n`;
       } else {
-        // Base64 generic fallback
-        attachedText += `\n[Tài liệu đính kèm: ${file.name} (${file.type})]`;
+        attachedText += `\n[Tài liệu đính kèm: ${file.name}]\n`;
       }
     }
   }
@@ -315,44 +297,106 @@ Hãy xuất ra DUY NHẤT một chuỗi JSON hợp lệ với cấu trúc:
   };
 };
 
-export const gradeSubmissionOllama = async (
-  config: GradingConfig,
-  ollamaConfig: OllamaConfig
-): Promise<{ content: string; score: string }> => {
+export const gradeSingleSubmissionOllama = async (
+  submissionFile: File,
+  answerKeyFile: File | null,
+  gradingType: 'auto' | 'trac-nghiem' | 'tu-luan' | 'hon-hop' = 'auto',
+  ollamaConfig: OllamaConfig,
+  studentName?: string,
+  options?: {
+    examQuestionFile?: File | null;
+    examQuestionText?: string;
+    answerKeyText?: string;
+    fastFinalResultGrading?: boolean;
+  }
+): Promise<{ 
+  students: any[];
+  content: string; 
+  score: string;
+  studentName: string;
+  studentId?: string;
+  className?: string;
+  examCode?: string;
+}> => {
   const images: string[] = [];
   let extraText = '';
 
-  if (config.submissionFile) {
-    const text = await tryReadAsText(config.submissionFile);
-    if (text) {
-      extraText += `\n--- Bài làm của học sinh (${config.submissionFile.name}) ---\n${text}\n`;
-    } else if (config.submissionFile.type.startsWith('image/')) {
-      images.push(await fileToBase64(config.submissionFile));
+  if (options?.examQuestionFile) {
+    const qExtracted = await extractFileContent(options.examQuestionFile);
+    if (qExtracted.type === 'text' && qExtracted.text) {
+      extraText += `\n--- ĐỀ BÀI (ĐỀ THI GỐC): ${options.examQuestionFile.name} ---\n${qExtracted.text}\n`;
+    } else if (qExtracted.type === 'image' && qExtracted.base64) {
+      images.push(qExtracted.base64);
+      extraText += `\n--- ĐỀ BÀI (ảnh đính kèm bên dưới) ---\n`;
     }
   }
 
-  if (config.answerKeyFile) {
-    const text = await tryReadAsText(config.answerKeyFile);
-    if (text) {
-      extraText += `\n--- Đáp án chuẩn & Thang điểm (${config.answerKeyFile.name}) ---\n${text}\n`;
-    } else if (config.answerKeyFile.type.startsWith('image/')) {
-      images.push(await fileToBase64(config.answerKeyFile));
+  if (options?.examQuestionText && options.examQuestionText.trim()) {
+    extraText += `\n--- ĐỀ BÀI (nhập trực tiếp) ---\n${options.examQuestionText.trim()}\n`;
+  }
+
+  const subExtracted = await extractFileContent(submissionFile);
+  if (subExtracted.type === 'text' && subExtracted.text) {
+    extraText += `\n--- Bài làm của thí sinh: "${studentName || submissionFile.name}" ---\n${subExtracted.text}\n`;
+  } else if (subExtracted.type === 'image' && subExtracted.base64) {
+    images.push(subExtracted.base64);
+    extraText += `\n--- Bài làm ảnh của thí sinh: "${studentName || submissionFile.name}" đính kèm bên dưới ---\n`;
+  } else if (subExtracted.text) {
+    extraText += `\n--- Bài làm của thí sinh: "${studentName || submissionFile.name}" ---\n${subExtracted.text}\n`;
+  } else {
+    extraText += `\n[Tài liệu bài làm: ${submissionFile.name}]\n`;
+  }
+
+  if (answerKeyFile) {
+    const keyExtracted = await extractFileContent(answerKeyFile);
+    if (keyExtracted.type === 'text' && keyExtracted.text) {
+      extraText += `\n--- Đáp án chuẩn & Thang điểm (${answerKeyFile.name}) ---\n${keyExtracted.text}\n`;
+    } else if (keyExtracted.type === 'image' && keyExtracted.base64) {
+      images.push(keyExtracted.base64);
+      extraText += `\n--- Đáp án chuẩn (ảnh) đính kèm ---\n`;
+    } else if (keyExtracted.text) {
+      extraText += `\n--- Đáp án chuẩn & Thang điểm (${answerKeyFile.name}) ---\n${keyExtracted.text}\n`;
     }
   }
+
+  if (options?.answerKeyText && options.answerKeyText.trim()) {
+    extraText += `\n--- Đáp án chuẩn & Thang điểm (nhập trực tiếp) ---\n${options.answerKeyText.trim()}\n`;
+  }
+
+  const fastRule = options?.fastFinalResultGrading !== false;
 
   const prompt = `
-Đóng vai trò là giáo viên chấm thi.
-Loại bài thi: ${config.gradingType === 'trac-nghiem' ? 'Trắc nghiệm' : 'Tự luận'}.
+Đóng vai trò là Giám khảo Chấm thi Đại học công tâm, chi tiết và chính xác tuyệt đối.
+Tệp bài thi nộp lên: "${submissionFile.name}"
+Loại bài thi: ${gradingType === 'trac-nghiem' ? 'Trắc nghiệm' : gradingType === 'tu-luan' ? 'Tự luận' : 'Tự động'}.
 ${extraText}
-Hãy chấm điểm bài làm của sinh viên dựa trên đáp án chuẩn và thang điểm.
 
-Yêu cầu:
-- Tự luận: Chấm chi tiết từng câu, từng ý, đối chiếu thang điểm, chỉ rõ lỗi sai và điểm trừ.
-- Trắc nghiệm: Liệt kê số câu đúng, câu sai, tổng điểm.
-- Trả về JSON DUY NHẤT với định dạng:
+${fastRule ? `
+⭐ QUY TẮC CHẤM: Đúng kết quả cuối cùng cho điểm tối đa trọn vẹn của câu/ý đó. Nếu sai kết quả cuối cùng mới chấm điểm các thành phần (công thức, biến đổi, thay số) theo bareme điểm từng bước.
+` : ''}
+
+Yêu cầu bắt buộc:
+1. TÌM TÊN THÍ SINH & TÁCH BÀI LÀM:
+   - Đọc kỹ bài làm để tìm Họ và tên thật của thí sinh, MSSV/SBD, Lớp.
+   - NẾU TÀI LIỆU CHỨA BÀI THI CỦA 2 HAY NHIỀU THÍ SINH: Bắt buộc tách thành từng phần tử riêng biệt trong mảng "students" (mỗi em một phần tử).
+2. ĐỐI CHIẾU ĐÁP ÁN:
+   - Trắc nghiệm: Lập bảng đối chiếu (Câu | Đáp án chọn | Đáp án đúng | Đánh giá | Điểm).
+   - Tự luận: Lập bảng điểm chi tiết từng câu theo quy tắc trên:
+     | Câu / Ý | Yêu cầu đề bài | Kết quả cuối của HS | Đánh giá KQ cuối | Phương thức chấm | Thang điểm | Điểm đạt | Nhận xét chi tiết (Thành phần nếu sai) |
+3. PHIẾU CHẤM ĐIỂM CHUẨN ĐẠI HỌC TRONG "feedback":
+   Gồm Tiêu đề phiếu, Thông tin thí sinh, Bảng điểm chi tiết, Tổng điểm và Bảng chữ ký 2 giám khảo.
+4. Trả về đúng JSON:
 {
-  "feedback": "Bản nhận xét Markdown chi tiết từng câu kèm lời giải và lỗi sai...",
-  "score": "8.5/10"
+  "students": [
+    {
+      "studentName": "Họ và tên thí sinh",
+      "studentId": "MSSV nếu có",
+      "className": "Lớp nếu có",
+      "examCode": "Mã đề nếu có",
+      "score": "8.5/10",
+      "feedback": "Nội dung phiếu chấm điểm Markdown..."
+    }
+  ]
 }`;
 
   const messages: any[] = [
@@ -369,7 +413,8 @@ Yêu cầu:
     stream: false,
     format: 'json',
     options: {
-      temperature: 0.2,
+      temperature: 0.0,
+      seed: 42,
     },
   };
 
@@ -390,16 +435,54 @@ Yêu cầu:
       .replace(/```\s*$/gi, '')
       .trim();
     const parsed = JSON.parse(cleaned);
+
+    const studentsList = Array.isArray(parsed.students) && parsed.students.length > 0
+      ? parsed.students
+      : [{
+          studentName: parsed.studentName || studentName || submissionFile.name.replace(/\.[^/.]+$/, ''),
+          studentId: parsed.studentId,
+          className: parsed.className,
+          examCode: parsed.examCode,
+          score: parsed.score || 'N/A',
+          feedback: parsed.feedback || rawContent
+        }];
+
+    const first = studentsList[0];
     return {
-      content: parsed.feedback || rawContent,
-      score: parsed.score || 'N/A',
+      students: studentsList,
+      content: first.feedback,
+      score: first.score,
+      studentName: first.studentName || studentName || submissionFile.name.replace(/\.[^/.]+$/, ''),
+      studentId: first.studentId,
+      className: first.className,
+      examCode: first.examCode,
     };
   } catch {
     // Extract score from text if possible
     const scoreMatch = rawContent.match(/(\d+(\.\d+)?\s*\/\s*10)/);
+    const fallbackScore = scoreMatch ? scoreMatch[1] : 'Đã chấm';
+    const fallbackName = studentName || submissionFile.name.replace(/\.[^/.]+$/, '');
     return {
+      students: [{
+        studentName: fallbackName,
+        score: fallbackScore,
+        feedback: rawContent
+      }],
       content: rawContent,
-      score: scoreMatch ? scoreMatch[1] : 'Đã chấm',
+      score: fallbackScore,
+      studentName: fallbackName,
     };
   }
 };
+
+export const gradeSubmissionOllama = async (
+  config: GradingConfig,
+  ollamaConfig: OllamaConfig
+): Promise<{ content: string; score: string }> => {
+  const firstFile = config.submissionFiles && config.submissionFiles.length > 0 ? config.submissionFiles[0] : null;
+  if (!firstFile) {
+    throw new Error('Không có file bài làm nào để chấm.');
+  }
+  return gradeSingleSubmissionOllama(firstFile, config.answerKeyFile, config.gradingType, ollamaConfig);
+};
+
