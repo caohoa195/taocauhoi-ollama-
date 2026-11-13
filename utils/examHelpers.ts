@@ -521,7 +521,7 @@ export function restoreCorruptedLatexControlChars(str: string): string {
     .replace(/\x09(?=(?:ext|imes|heta|au|an|riangle|ilde|frac)\b)/g, '\\t')
     .replace(/\x0c(?=(?:rac|orall)\b)/g, '\\f')
     .replace(/\x0d(?=(?:ight|ho|angle)\b)/g, '\\r')
-    .replace(/\x08(?=(?:eta|egin|ar|oxed|inom|ackslash)\b)/g, '\\b');
+    .replace(/\x08(?=(?:oldsymbol|eta|egin|ar|oxed|inom|ackslash|f|ig|ullet)\b)/g, '\\b');
 }
 
 export function sanitizeLatexInJsonString(jsonStr: string): string {
@@ -592,7 +592,7 @@ export function sanitizeLatexInJsonString(jsonStr: string): string {
       const isLatexT = next === 't' && /^(?:ext|imes|heta|au|an|riangle|ilde|frac)\b/.test(rest);
       const isLatexF = next === 'f' && /^(?:rac|orall)\b/.test(rest);
       const isLatexR = next === 'r' && /^(?:ight|ho|angle)\b/.test(rest);
-      const isLatexB = next === 'b' && /^(?:eta|egin|ar|oxed|inom|ackslash)\b/.test(rest);
+      const isLatexB = next === 'b' && /^(?:oldsymbol|eta|egin|ar|oxed|inom|ackslash|f|ig|ullet)\b/.test(rest);
       const isLatexN = next === 'n' && /^(?:eq|u|abla|ot)\b/.test(rest);
 
       if (isLatexT || isLatexF || isLatexR || isLatexB || isLatexN) {

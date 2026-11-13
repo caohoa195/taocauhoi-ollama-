@@ -421,6 +421,12 @@ export const gradeSingleSubmissionOllama = async (
   });
   const submissionHasText = subRes.hasExtractedText;
 
+  if (submissionImages.length === 0 && !submissionHasText) {
+    throw new Error(
+      `Không thể đọc nội dung hoặc chuyển trang PDF "${submissionFile.name}" thành hình ảnh cho Ollama. Vui lòng chuyển sang Gemini Cloud hoặc kiểm tra lại tệp.`
+    );
+  }
+
   if (answerKeyFile) {
     const kRes = await appendFileForOllama(answerKeyFile, 'TỆP ĐÁP ÁN CHUẨN & THANG ĐIỂM ĐỐI CHIẾU', referenceImages, 5, {
       skipImagesIfHasText: true,
@@ -432,34 +438,78 @@ export const gradeSingleSubmissionOllama = async (
     referenceText += `\n[NỘI DUNG ĐÁP ÁN CHUẨN & THANG ĐIỂM ĐƯỢC GIÁO VIÊN CUNG CẤP]:\n${options.answerKeyText.trim()}\n`;
   }
 
-  // Step 1: Focused per-page Vision OCR when submission has rendered page/photo images
+  // Step 1A: Dedicated 1-image OCR for rotated right-margin student info strip (phách dọc)
+  let headerOcrText = '';
+  if (subRes.headerCropImage) {
+    try {
+      const hdrData = await callOllamaApi(
+        ollamaConfig,
+        '/api/chat',
+        {
+          model: ollamaConfig.model,
+          messages: [
+            {
+              role: 'system',
+              content: 'Bạn chỉ đọc thông tin thí sinh trên ảnh tiêu đề/phách đã xoay ngang. Tuyệt đối không bịa tên nếu không nhìn thấy chữ.',
+            },
+            {
+              role: 'user',
+              content: `Đọc ảnh phần phách tiêu đề của bài thi "${submissionFile.name}". Ghi đúng nguyên văn các thông tin thực sự nhìn thấy:
+- Họ và tên thí sinh: [nếu không có hoặc mờ ghi "Không đọc được"]
+- MSSV / SBD: [nếu không có ghi "Không có"]
+- Lớp / Khóa: [nếu không có ghi "Không có"]
+- Mã đề thi: [nếu không có ghi "Không có"]
+TUYỆT ĐỐI KHÔNG tự bịa tên (cấm bịa NGUYEN THI HOA, Nguyễn Minh Anh, Nguyễn Văn A...).`,
+              images: [subRes.headerCropImage],
+            },
+          ],
+          stream: false,
+          options: {
+            temperature: 0.0,
+            seed: 42,
+            num_ctx: 4096,
+          },
+        },
+        false
+      );
+      headerOcrText = (hdrData?.message?.content || hdrData?.response || '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .trim();
+    } catch (hdrErr: any) {
+      if (isVisionUnsupportedError(hdrErr?.message || '')) {
+        if (!submissionHasText) throw hdrErr;
+      } else {
+        console.warn('Header phách OCR notice:', hdrErr);
+      }
+    }
+  }
+
+  // Step 1B: Focused 1-image-per-page Vision OCR across ALL pages of the student's paper
   let transcribedPagesText = '';
+  const looksLikeMissingImageReply = (txt: string): boolean => {
+    const lower = txt.toLowerCase();
+    return (
+      lower.includes('không có ảnh') ||
+      lower.includes('chờ ảnh') ||
+      lower.includes('chưa có ảnh') ||
+      lower.includes('không thấy ảnh') ||
+      lower.includes('không nhận được ảnh')
+    );
+  };
+
   if (submissionImages.length > 0) {
     const pageTranscripts: string[] = [];
     for (let i = 0; i < submissionImages.length; i++) {
       const pageNum = i + 1;
       const isFirstPage = i === 0;
-      const pageImgs = isFirstPage && subRes.headerCropImage
-        ? [submissionImages[0], subRes.headerCropImage]
-        : [submissionImages[i]];
 
       const ocrPrompt = isFirstPage
-        ? `Bạn là chuyên viên nhập liệu khảo thí. Hãy đọc ảnh Trang 1 của bài thi "${submissionFile.name}"${subRes.headerCropImage ? ' (Ảnh 1 là toàn bộ Trang 1; Ảnh 2 là phần khung phách/tiêu đề bên lề phải đã được cắt phóng to và xoay ngang cho dễ đọc)' : ''}.
-
-NHIỆM VỤ BẮT BUỘC (TRÌNH BÀY DẠNG VĂN BẢN THƯỜNG, KHÔNG VIẾT JSON):
-1. TRÍCH XUẤT CHÍNH XÁC THÔNG TIN THÍ SINH (nhìn thật kỹ cả Ảnh 1 và Ảnh 2 đã xoay ngang):
-   - Họ và tên thí sinh: [chép đúng từng chữ nhìn thấy trên giấy; nếu mờ hoặc không có thì ghi "Không đọc được"]
-   - MSSV / SBD: [chép đúng số nhìn thấy; nếu không có ghi "Không có"]
-   - Lớp / Khóa: [chép đúng lớp nhìn thấy; nếu không có ghi "Không có"]
-   - Mã đề thi: [chép đúng mã đề nhìn thấy nếu có; nếu không có ghi "Không có"]
-   CẢNH BÁO NGHIÊM NGẶT: TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ BỊA TÊN GIẢ HAY MÃ SỐ GIẢ (như NGUYEN THI HOA, Nguyễn Minh Anh, Nguyễn Văn A, 2022123456, 12A1001, K65...). Thấy chữ gì chép đúng chữ đó, không thấy thì ghi "Không đọc được".
-
-2. CHÉP NGUYÊN VĂN TOÀN BỘ BÀI LÀM VIẾT TAY TRÊN TRANG 1:
-   - Ghi rõ tiêu đề từng câu / từng ý (ví dụ: Câu 1.a, Câu 1.b...) và chép nguyên văn công thức, phép biến đổi, thay số, kết quả cuối cùng (hoặc đáp án khoanh tròn) của thí sinh.
-   - Không tự sửa sai cho thí sinh; thí sinh viết gì chép nguyên văn nấy.`
-        : `Hãy đọc ảnh Trang ${pageNum} (của bài thi "${submissionFile.name}").
-1. Nếu trên trang này có ghi lại tên thí sinh mới hoặc mã số thí sinh mới (trường hợp 1 file chứa nhiều bài), hãy ghi ra dòng đầu tiên; nếu là trang làm bài tiếp theo thì ghi "[Trang tiếp theo]".
-2. CHÉP NGUYÊN VĂN TOÀN BỘ LỜI GIẢI VIẾT TAY TRÊN TRANG ${pageNum} theo đúng từng câu / ý (ví dụ: Câu 1.b, Câu 1.c, Câu 1.d, Câu 2.a, Câu 2.b...). Giữ nguyên mọi công thức, biểu thức, thay số và đáp số cuối cùng của thí sinh (không tự sửa lỗi).`;
+        ? `Hãy đọc ảnh Trang 1 của bài thi "${submissionFile.name}".
+1. Ghi lại thông tin thí sinh nhìn thấy trên trang này (Họ tên, MSSV, Lớp, Mã đề; nếu không đọc được ghi "Không đọc được", tuyệt đối không bịa tên).
+2. CHÉP NGUYÊN VĂN toàn bộ lời giải viết tay của thí sinh trên Trang 1 theo từng câu / ý (Câu 1.a, Câu 1.b...), giữ nguyên công thức, thay số và kết quả cuối cùng.`
+        : `Hãy đọc ảnh Trang ${pageNum} của bài thi "${submissionFile.name}".
+1. Nếu có ghi tên/mã thí sinh mới ở đầu trang thì ghi ra; nếu là trang tiếp theo của cùng thí sinh ghi "[Trang tiếp theo]".
+2. CHÉP NGUYÊN VĂN toàn bộ lời giải viết tay trên Trang ${pageNum} theo từng câu / ý (Câu 1.b, 1.c, 1.d, Câu 2.a, 2.b...). Giữ nguyên công thức, thay số và đáp số cuối cùng của thí sinh.`;
 
       try {
         const ocrData = await callOllamaApi(
@@ -475,7 +525,7 @@ NHIỆM VỤ BẮT BUỘC (TRÌNH BÀY DẠNG VĂN BẢN THƯỜNG, KHÔNG VIẾ
               {
                 role: 'user',
                 content: ocrPrompt,
-                images: pageImgs,
+                images: [submissionImages[i]],
               },
             ],
             stream: false,
@@ -490,7 +540,7 @@ NHIỆM VỤ BẮT BUỘC (TRÌNH BÀY DẠNG VĂN BẢN THƯỜNG, KHÔNG VIẾ
         const pageOcrText = (ocrData?.message?.content || ocrData?.response || '')
           .replace(/<think>[\s\S]*?<\/think>/gi, '')
           .trim();
-        if (pageOcrText) {
+        if (pageOcrText && !looksLikeMissingImageReply(pageOcrText)) {
           pageTranscripts.push(`=== NỘI DUNG TRANG ${pageNum} ===\n${pageOcrText}`);
         }
       } catch (ocrErr: any) {
@@ -503,8 +553,9 @@ NHIỆM VỤ BẮT BUỘC (TRÌNH BÀY DẠNG VĂN BẢN THƯỜNG, KHÔNG VIẾ
       }
     }
 
-    if (pageTranscripts.length > 0) {
-      transcribedPagesText = `\n[BÀI LÀM VIẾT TAY ĐÃ ĐỌC TRỰC TIẾP TỪ ĐỦ ${submissionImages.length} TRANG ẢNH CỦA BÀI THI "${submissionFile.name}"]:\n${pageTranscripts.join('\n\n')}\n`;
+    const totalOcrChars = pageTranscripts.join('').trim().length;
+    if (pageTranscripts.length > 0 && totalOcrChars >= 40) {
+      transcribedPagesText = `\n[THÔNG TIN PHÁCH TIÊU ĐỀ ĐÃ XOAY NGANG TỪ TRANG 1]:\n${headerOcrText || '(Xem trong Nội dung Trang 1 bên dưới)'}\n\n[BÀI LÀM VIẾT TAY ĐÃ ĐỌC TRỰC TIẾP TỪ ${pageTranscripts.length}/${submissionImages.length} TRANG ẢNH CỦA BÀI THI "${submissionFile.name}"]:\n${pageTranscripts.join('\n\n')}\n`;
     }
   }
 
@@ -523,7 +574,7 @@ NHIỆM VỤ BẮT BUỘC (TRÌNH BÀY DẠNG VĂN BẢN THƯỜNG, KHÔNG VIẾ
 
   const userPrompt = `${referenceText}\n${combinedSubmissionSection}\n${userGradingRequirements}\n
 LƯU Ý ĐẶC BIỆT KHI TỔNG HỢP KẾT QUẢ:
-- Lấy ĐÚNG Họ và tên thí sinh, MSSV, Lớp, Mã đề từ phần [NỘI DUNG TRANG 1] ở trên (nếu [NỘI DUNG TRANG 1] ghi "Không đọc được" thì ghi "Không rõ (không đọc được trên ảnh)", TUYỆT ĐỐI KHÔNG tự bịa tên khác).
+- Lấy ĐÚNG Họ và tên thí sinh, MSSV, Lớp, Mã đề từ phần [THÔNG TIN PHÁCH TIÊU ĐỀ ĐÃ XOAY NGANG] và [NỘI DUNG TRANG 1] ở trên (nếu không đọc được thì ghi "Không rõ (không đọc được trên ảnh)", TUYỆT ĐỐI KHÔNG tự bịa tên khác).
 - Đối chiếu ĐẦY ĐỦ tất cả các trang (Trang 1 đến Trang ${submissionImages.length || 1}) để không bỏ sót bất kỳ câu/ý nào thí sinh đã làm ở các trang sau.
 - Trong chuỗi JSON, nếu viết công thức LaTeX thì phải escape dấu gạch chéo ngược thành hai dấu (ví dụ: "\\\\text{x}", "\\\\frac{a}{b}").
 
