@@ -517,6 +517,7 @@ export function synchronizeStudentScores(students: any[]): void {
 export interface StructuredQuestionGradeRow {
   question: string;
   requirement?: string;
+  expectedAnswer?: string;
   studentAnswer?: string;
   isFinalCorrect?: string;
   gradingMethod?: string;
@@ -562,9 +563,46 @@ const sanitizeTableCell = (val: any, fallback = ''): string => {
   return s.replace(/\r?\n/g, '<br>').replace(/\|/g, '/').replace(/\s+/g, ' ').trim();
 };
 
+export function sanitizeStudentField(value: any, kind: 'name' | 'meta' = 'name'): string {
+  let raw = String(value ?? '')
+    .replace(/\*\*/g, '')
+    .replace(/^(?:họ và tên|họ tên|thí sinh|mssv|sbd|mã số sinh viên|lớp|mã đề)\s*[:：\-]?\s*/i, '')
+    .trim();
+  if (!raw) return '';
+
+  const lower = raw.toLowerCase().replace(/[.:\-_[\]()]/g, ' ').replace(/\s+/g, ' ').trim();
+  const invalidExact = new Set([
+    'không xác định',
+    'không xác định được',
+    'không rõ',
+    'chưa xác định',
+    'chưa rõ',
+    'không tìm thấy',
+    'không thấy',
+    'không đọc được',
+    'không có',
+    'không ghi',
+    'trống',
+    'bỏ trống',
+    'unknown',
+    'n a',
+    'na',
+    'none',
+    'null',
+    'undefined',
+  ]);
+  if (invalidExact.has(lower)) return '';
+  if (kind === 'name' && /^(?:không\s+(?:xác định|rõ|thấy|tìm thấy|ghi|có)|thí sinh|học sinh|sinh viên)$/i.test(lower)) {
+    return '';
+  }
+  return raw;
+}
+
 const normalizeQuestionKey = (q: string): string => {
   return String(q || '')
     .replace(/\*\*/g, '')
+    // Preserve sub-part letters like (a), (b), (c), (d) while stripping point/difficulty annotations
+    .replace(/\(\s*([a-d])\s*\)/gi, ' $1 ')
     .replace(/\([^)]*\)/g, ' ')
     .replace(/[.:：\-]/g, ' ')
     .replace(/\s+/g, ' ')
@@ -596,6 +634,95 @@ export function parseMasterRubricItems(masterRubric?: string): Array<{ question:
   return items;
 }
 
+export function extractDeterministicRubricFromText(rawText?: string): string {
+  if (!rawText || typeof rawText !== 'string') return '';
+  const lines = rawText.split(/\r?\n/);
+  const items: Array<{ question: string; maxScore: number }> = [];
+  let current: { question: string; maxScore: number } | null = null;
+
+  const extractLinePoints = (line: string): number => {
+    const clean = line.replace(/\*\*/g, '').trim();
+    if (!clean || /tổng điểm|tổng cộng|thang điểm/i.test(clean)) return 0;
+
+    // Pipe-delimited table row: inspect last cell first
+    if (clean.includes('|')) {
+      const cols = clean.split('|').map((c) => c.trim()).filter((c) => c.length > 0);
+      if (cols.length >= 2) {
+        const lastCol = cols[cols.length - 1];
+        const ptMatches = [...lastCol.matchAll(/(\d+(?:[.,]\d+)?)\s*(?:đ|điểm)?(?=$|[\s.,;:)/|+\-])/gi)];
+        if (ptMatches.length > 0 && /^[\d.,\sđđiểm/+\-]+$/i.test(lastCol)) {
+          let sum = 0;
+          for (const pm of ptMatches) {
+            const v = parseFloat(pm[1].replace(',', '.'));
+            if (Number.isFinite(v) && v > 0 && v <= 10) sum += v;
+          }
+          if (sum > 0) return roundScore2(sum);
+        }
+      }
+    }
+
+    // Explicit "... 0,75 đ" or "... (1.5 điểm)" (avoid \b after Unicode 'đ')
+    const explicitMatches = [...clean.matchAll(/(\d+(?:[.,]\d+)?)\s*(?:đ|điểm)(?=$|[\s.,;:)/|])/gi)];
+    if (explicitMatches.length > 0) {
+      let sum = 0;
+      for (const em of explicitMatches) {
+        const v = parseFloat(em[1].replace(',', '.'));
+        if (Number.isFinite(v) && v > 0 && v <= 10) sum += v;
+      }
+      return roundScore2(sum);
+    }
+
+    // Standalone decimal point value on its own line (from table column extraction)
+    if (/^\d+(?:[.,]\d+)$/.test(clean)) {
+      const v = parseFloat(clean.replace(',', '.'));
+      if (Number.isFinite(v) && v > 0 && v <= 5) return roundScore2(v);
+    }
+
+    return 0;
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\*\*/g, '').trim();
+    if (!line || /^\|?\s*[:\-| ]+\s*$/.test(line)) continue;
+    if (/^(?:tổng điểm|tổng cộng)/i.test(line)) {
+      if (current) {
+        items.push(current);
+        current = null;
+      }
+      continue;
+    }
+
+    const firstCell = line.includes('|') ? line.split('|').map((c) => c.trim()).find((c) => c.length > 0) || line : line;
+    const headerMatch = firstCell.match(/^(?:Câu|Bài)\s*(\d+(?:\s*[.,]?\s*[a-d])?)(?=\s*(?:[:.\-|•(]|$))/i);
+
+    if (headerMatch) {
+      if (current) {
+        items.push(current);
+      }
+      const qLabel = `Câu ${headerMatch[1].replace(/\s+/g, '')}`.replace(/\.$/, '');
+      const linePts = extractLinePoints(line);
+      current = { question: qLabel, maxScore: linePts };
+    } else if (current) {
+      const extraPts = extractLinePoints(line);
+      if (extraPts > 0) {
+        current.maxScore = roundScore2(current.maxScore + extraPts);
+      }
+    }
+  }
+
+  if (current) {
+    items.push(current);
+  }
+
+  const valid = items.filter((it) => it.maxScore > 0 && it.maxScore <= 10);
+  if (valid.length < 2) return '';
+
+  const total = roundScore2(valid.reduce((acc, it) => acc + it.maxScore, 0));
+  if (total < 9.0 || total > 10.5) return '';
+
+  return valid.map((it) => `- ${it.question}: Thang điểm tối đa ${it.maxScore}`).join('\n');
+}
+
 export function enforceMasterRubricOnRows(
   rawRows: StructuredQuestionGradeRow[],
   masterRubric?: string
@@ -605,16 +732,22 @@ export function enforceMasterRubricOnRows(
     const maxScore = roundScore2(Math.max(0, parseNumericScore(r?.maxScore, 0)));
     let earnedScore = roundScore2(Math.max(0, parseNumericScore(r?.earnedScore, 0)));
 
-    const finalEval = sanitizeTableCell(r?.isFinalCorrect, '');
-    const method = sanitizeTableCell(r?.gradingMethod, '');
+    let finalEval = sanitizeTableCell(r?.isFinalCorrect, '');
+    let method = sanitizeTableCell(r?.gradingMethod, '');
     const studentAns = sanitizeTableCell(r?.studentAnswer, '');
 
-    if (
-      /không làm|bỏ trống/i.test(finalEval) ||
+    const isBlank =
+      /không làm|bỏ trống|chưa làm/i.test(finalEval) ||
       /^bỏ trống$/i.test(method) ||
-      /^bỏ trống$/i.test(studentAns)
-    ) {
+      /^(?:bỏ trống|không làm|chưa làm|không thấy|không có bài|không ghi)$/i.test(studentAns);
+
+    if (isBlank) {
       earnedScore = 0;
+      finalEval = 'Không làm';
+      method = 'Bỏ trống';
+    } else if (/^(?:sai|thiếu)$/i.test(finalEval) && maxScore > 0 && earnedScore >= maxScore) {
+      // Prevent small models from emitting "Sai" while still giving 100% of maxScore
+      earnedScore = roundScore2(Math.max(0, maxScore - 0.25));
     }
 
     if (maxScore > 0) {
@@ -626,7 +759,8 @@ export function enforceMasterRubricOnRows(
     return {
       question,
       requirement: sanitizeTableCell(r?.requirement, 'Theo đề thi'),
-      studentAnswer: studentAns || 'Không ghi',
+      expectedAnswer: sanitizeTableCell(r?.expectedAnswer, ''),
+      studentAnswer: studentAns || 'Bỏ trống',
       isFinalCorrect: finalEval || (earnedScore >= maxScore && maxScore > 0 ? 'Đúng' : earnedScore > 0 ? 'Sai / Thiếu' : 'Sai'),
       gradingMethod: method || (earnedScore >= maxScore && maxScore > 0 ? 'Trọn điểm (Đúng KQ cuối)' : earnedScore > 0 ? 'Chấm thành phần (Sai KQ cuối)' : 'Sai / Không có điểm'),
       maxScore,
@@ -655,7 +789,10 @@ export function enforceMasterRubricOnRows(
     if (matchIdx !== -1) {
       usedIndices.add(matchIdx);
       const matched = sanitized[matchIdx];
-      const clampedEarned = roundScore2(Math.max(0, Math.min(item.maxScore, matched.earnedScore)));
+      let clampedEarned = roundScore2(Math.max(0, Math.min(item.maxScore, matched.earnedScore)));
+      if (/^(?:sai|thiếu)$/i.test(matched.isFinalCorrect || '') && clampedEarned >= item.maxScore && item.maxScore > 0) {
+        clampedEarned = roundScore2(Math.max(0, item.maxScore - 0.25));
+      }
       matchedRows.push({
         ...matched,
         question: item.question,
@@ -713,10 +850,11 @@ export function formatGradingFeedbackFromStructured(
   const scoreText = numberToVietnameseScore(totalScoreNum);
   const { gpa4, gradeLetter, rank } = getGradeMetadata(totalScoreNum);
 
-  const studentName = String(st.studentName || fallbackStudentName || 'Thí sinh').trim();
-  const studentId = String(st.studentId || 'Không có').trim() || 'Không có';
-  const className = String(st.className || 'Không có').trim() || 'Không có';
-  const examCode = String(st.examCode || 'Không có').trim() || 'Không có';
+  const cleanFallback = sanitizeStudentField(fallbackStudentName, 'name') || String(fallbackStudentName || '').trim() || 'Thí sinh';
+  const studentName = sanitizeStudentField(st.studentName, 'name') || cleanFallback;
+  const studentId = sanitizeStudentField(st.studentId, 'meta') || 'Không có';
+  const className = sanitizeStudentField(st.className, 'meta') || 'Không có';
+  const examCode = sanitizeStudentField(st.examCode, 'meta') || 'Không có';
 
   const strengths = String(st.strengths || '').trim() ||
     (totalScoreNum >= 5 ? 'Nắm được kiến thức cơ bản và trình bày được một số phần trọng tâm.' : 'Có cố gắng hoàn thành một phần bài làm.');

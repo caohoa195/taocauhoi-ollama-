@@ -1,12 +1,13 @@
 import { ExamConfig, GradingConfig, GeneratedContent, OllamaConfig } from "../types";
-import { extractFileContent, extractPdfForOllama } from "./fileUtils";
+import { extractFileContent, extractPdfForOllama, extractPortraitPhachImageCrop } from "./fileUtils";
 import {
   buildExamMetaAndPrompt,
   buildGradingUserPrompt,
+  extractDeterministicRubricFromText,
   formatExamFromVariants,
   formatGradingFeedbackFromStructured,
   getExamSystemInstruction,
-  GRADING_SYSTEM_INSTRUCTION,
+  sanitizeStudentField,
   StructuredGradedStudent,
   synchronizeStudentScores,
 } from "../utils/examHelpers";
@@ -58,6 +59,25 @@ const OLLAMA_EXAM_SCHEMA = {
   },
 };
 
+const OLLAMA_RUBRIC_SCHEMA = {
+  type: 'object',
+  required: ['items'],
+  properties: {
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['question', 'maxScore'],
+        properties: {
+          question: { type: 'string' },
+          maxScore: { type: 'number' },
+          expectedAnswer: { type: 'string' },
+        },
+      },
+    },
+  },
+};
+
 const OLLAMA_GRADING_SCHEMA = {
   type: 'object',
   required: ['students'],
@@ -76,13 +96,29 @@ const OLLAMA_GRADING_SCHEMA = {
             type: 'array',
             items: {
               type: 'object',
-              required: ['question', 'studentAnswer', 'isFinalCorrect', 'gradingMethod', 'maxScore', 'earnedScore', 'comment'],
+              required: [
+                'question',
+                'expectedAnswer',
+                'studentAnswer',
+                'isFinalCorrect',
+                'gradingMethod',
+                'maxScore',
+                'earnedScore',
+                'comment',
+              ],
               properties: {
                 question: { type: 'string' },
                 requirement: { type: 'string' },
+                expectedAnswer: { type: 'string' },
                 studentAnswer: { type: 'string' },
-                isFinalCorrect: { type: 'string' },
-                gradingMethod: { type: 'string' },
+                isFinalCorrect: {
+                  type: 'string',
+                  enum: ['Đúng', 'Sai', 'Thiếu', 'Không làm'],
+                },
+                gradingMethod: {
+                  type: 'string',
+                  enum: ['Trọn điểm (Đúng KQ cuối)', 'Chấm thành phần (Sai KQ cuối)', 'Bỏ trống'],
+                },
                 maxScore: { type: 'number' },
                 earnedScore: { type: 'number' },
                 comment: { type: 'string' },
@@ -96,6 +132,24 @@ const OLLAMA_GRADING_SCHEMA = {
     },
   },
 };
+
+const OLLAMA_GRADING_SYSTEM_INSTRUCTION = `Bạn là Giám khảo Chấm thi Đại học công tâm, chính xác và ổn định tuyệt đối (DETERMINISTIC).
+Nhiệm vụ của bạn là đọc ảnh/nội dung bài làm thí sinh, đối chiếu với đề bài và đáp án chuẩn, rồi điền dữ liệu JSON có cấu trúc.
+
+QUY TẮC BẮT BUỘC:
+1. ĐỌC THÔNG TIN THÍ SINH (PHÁCH & TRANG ĐẦU):
+   - Nếu có "Ảnh PHÁCH đã xoay thẳng đứng", hãy đọc KỸ chữ viết tay ở mục "Họ và tên:" (studentName), "Lớp:" (className), "Số báo danh / MSSV:" (studentId), "Mã đề:" (examCode).
+   - Trả về đúng Họ tên thật viết tay (ví dụ "Ngô Quang Huy", lớp "ĐHCN7"). Nếu thực sự không có chỗ ghi tên hoặc không đọc được, trả về chuỗi rỗng "" (TUYỆT ĐỐI KHÔNG tự viết chữ "Không xác định được").
+2. CỐ ĐỊNH BAREM 10.0 ĐIỂM (KHÔNG ĐƯỢC BỎ SÓT CÂU):
+   - Phải tạo ĐẦY ĐỦ 1 phần tử trong "questionRows" cho MỌI câu / ý có trong đề thi và barem (tổng maxScore = 10.0).
+   - TUYỆT ĐỐI KHÔNG bỏ qua các câu thí sinh không làm rồi dồn điểm lên 10.0 cho các câu đã làm.
+3. KIỂM TRA TỪNG TRANG BÀI LÀM & CHỐNG CHẤM NHẦM 10/10:
+   - Trước khi cho điểm từng câu, viết rõ "expectedAnswer" (đáp án chuẩn) và "studentAnswer" (những gì thí sinh thực sự viết trong các ảnh trang bài làm).
+   - BỎ TRỐNG / KHÔNG LÀM: Nếu trong bài làm hoàn toàn không thấy lời giải của câu đó (hoặc chỉ chép lại đề/tên câu rồi để trống), BẮT BUỘC ghi studentAnswer = "Bỏ trống", isFinalCorrect = "Không làm", gradingMethod = "Bỏ trống", earnedScore = 0.
+   - ĐÚNG KẾT QUẢ CUỐI: Chỉ đặt isFinalCorrect = "Đúng" và cho earnedScore = maxScore khi thí sinh có lời giải hợp lý VÀ kết quả cuối cùng đúng với đáp án chuẩn (kể cả đúng đơn vị/bản chất).
+   - SAI / THIẾU KẾT QUẢ CUỐI: Đặt isFinalCorrect = "Sai" hoặc "Thiếu", gradingMethod = "Chấm thành phần (Sai KQ cuối)", và chấm điểm thành phần từng bước đúng (earnedScore phải NHỎ HƠN maxScore, bước 0.25đ).`;
+
+const rubricExtractionCache = new Map<string, string>();
 
 const normalizeOllamaUrl = (rawUrl?: string): string => {
   let u = (rawUrl || 'http://localhost:11434').trim().replace(/\/+$/, '');
@@ -318,10 +372,11 @@ const appendFileForOllama = async (
   file: File,
   roleLabel: string,
   images: string[],
-  options: { maxPdfRenderPages?: number; onlyRenderIfNoText?: boolean } = {}
-): Promise<{ textBlock: string; hasExtractedText: boolean; normalizedText: string }> => {
-  const maxPdfRenderPages = options.maxPdfRenderPages ?? 4;
+  options: { maxPdfRenderPages?: number; onlyRenderIfNoText?: boolean; includePhachCrop?: boolean } = {}
+): Promise<{ textBlock: string; hasExtractedText: boolean; normalizedText: string; rawText: string }> => {
+  const maxPdfRenderPages = options.maxPdfRenderPages ?? 5;
   const onlyRenderIfNoText = options.onlyRenderIfNoText ?? false;
+  const includePhachCrop = options.includePhachCrop ?? false;
   const extracted = await extractFileContent(file);
 
   if (extracted.type === 'text' && extracted.text) {
@@ -332,16 +387,28 @@ const appendFileForOllama = async (
       textBlock: `\n--- [${roleLabel}] File: "${file.name}" ---\n${trimmed}\n`,
       hasExtractedText: trimmed.trim().length > 20,
       normalizedText: extracted.text.replace(/\s+/g, ' ').trim(),
+      rawText: extracted.text,
     };
   }
 
   if (extracted.type === 'image' && extracted.base64) {
+    let block = `\n--- [${roleLabel}] File ảnh: "${file.name}" ---\n`;
+    if (includePhachCrop) {
+      const phachB64 = await extractPortraitPhachImageCrop(file);
+      if (phachB64) {
+        images.push(phachB64);
+        const phachIdx = images.length;
+        block += `- Ảnh số ${phachIdx} là ẢNH PHÁCH ĐÃ XOAY THẲNG ĐỨNG (cạnh phải trang 1): BẮT BUỘC đọc Họ và tên (studentName), Lớp (className), SBD/MSSV (studentId), Mã đề (examCode) từ Ảnh số ${phachIdx}.\n`;
+      }
+    }
     images.push(extracted.base64);
     const imgIdx = images.length;
+    block += `- Ảnh số ${imgIdx} là toàn bộ trang bài làm: hãy đọc kỹ toàn bộ chữ viết tay, công thức, khoanh tròn và đáp số trong Ảnh số ${imgIdx}.\n`;
     return {
-      textBlock: `\n--- [${roleLabel}] Ảnh đính kèm số ${imgIdx}: "${file.name}" ---\n(Hãy đọc kỹ toàn bộ chữ viết tay, công thức, khoanh tròn và nội dung trong Ảnh số ${imgIdx}).\n`,
+      textBlock: block,
       hasExtractedText: false,
       normalizedText: '',
+      rawText: '',
     };
   }
 
@@ -355,16 +422,24 @@ const appendFileForOllama = async (
           : pdfData.text;
         block += `Nội dung văn bản trích xuất từ PDF:\n${cleanPdfText}\n`;
       }
+      if (includePhachCrop && pdfData.headerImages && pdfData.headerImages.length > 0) {
+        for (const phachB64 of pdfData.headerImages) {
+          images.push(phachB64);
+          const phachIdx = images.length;
+          block += `- Ảnh số ${phachIdx} là ẢNH PHÁCH ĐÃ XOAY THẲNG ĐỨNG (phần ghi tên bên phải Trang 1): BẮT BUỘC đọc chính xác Họ và tên thí sinh (studentName), Lớp (className), SBD/MSSV (studentId) từ Ảnh số ${phachIdx}.\n`;
+        }
+      }
       if (pdfData.images.length > 0) {
         const startIdx = images.length + 1;
         pdfData.images.forEach((b64) => images.push(b64));
         const endIdx = images.length;
-        block += `Các trang PDF được chuyển thành hình ảnh từ Ảnh số ${startIdx} đến Ảnh số ${endIdx} (hãy đọc kỹ chữ viết, công thức, hình vẽ và đánh dấu trong các ảnh trang này).\n`;
+        block += `- Các trang PDF từ Trang 1 đến Trang ${pdfData.images.length} tương ứng với Ảnh số ${startIdx} đến Ảnh số ${endIdx} (hãy đối chiếu kỹ từng câu bài làm trên tất cả các trang ảnh này).\n`;
       }
       return {
         textBlock: block,
         hasExtractedText: (pdfData.text || '').trim().length > 40,
         normalizedText: (pdfData.text || '').replace(/\s+/g, ' ').trim(),
+        rawText: pdfData.text || '',
       };
     } catch (pdfErr) {
       console.warn(`Không thể phân tích PDF "${file.name}" cho Ollama:`, pdfErr);
@@ -376,6 +451,7 @@ const appendFileForOllama = async (
       textBlock: `\n--- [${roleLabel}] File: "${file.name}" ---\n${extracted.text}\n`,
       hasExtractedText: extracted.text.trim().length > 20,
       normalizedText: extracted.text.replace(/\s+/g, ' ').trim(),
+      rawText: extracted.text,
     };
   }
 
@@ -383,7 +459,103 @@ const appendFileForOllama = async (
     textBlock: `\n[${roleLabel}: "${file.name}"]\n`,
     hasExtractedText: false,
     normalizedText: '',
+    rawText: '',
   };
+};
+
+// Pre-extract and anchor Master Rubric from the Answer Key / Exam Question BEFORE grading Student #1
+const ensureMasterRubricForOllama = async (
+  ollamaConfig: OllamaConfig,
+  params: {
+    existingMasterRubric?: string;
+    answerKeyRawText?: string;
+    examQuestionRawText?: string;
+    answerKeyTextArg?: string;
+    examQuestionTextArg?: string;
+    referenceImages?: string[];
+  }
+): Promise<string> => {
+  if (params.existingMasterRubric && params.existingMasterRubric.trim()) {
+    return params.existingMasterRubric.trim();
+  }
+
+  // 1. Fast deterministic extraction from Answer Key or Exam Question text (zero LLM latency)
+  const textCandidates = [
+    params.answerKeyTextArg,
+    params.answerKeyRawText,
+    params.examQuestionTextArg,
+    params.examQuestionRawText,
+  ].filter((t): t is string => Boolean(t && t.trim()));
+
+  for (const txt of textCandidates) {
+    const det = extractDeterministicRubricFromText(txt);
+    if (det) {
+      return det;
+    }
+  }
+
+  // 2. Fallback: 1-shot Ollama rubric extraction cached by reference signature
+  const combinedRefText = textCandidates.join('\n\n').slice(0, 12000).trim();
+  const refImgs = params.referenceImages || [];
+  if (!combinedRefText && refImgs.length === 0) {
+    return '';
+  }
+
+  const cacheKey = `${ollamaConfig.model}:${combinedRefText.slice(0, 500)}:${combinedRefText.length}:${refImgs.length}`;
+  const cached = rubricExtractionCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const payload = {
+      model: ollamaConfig.model,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Trích xuất danh sách cố định tất cả các câu/ý và thang điểm tối đa (tổng = 10.0 điểm) từ đề bài / đáp án chuẩn bên dưới. Trả về đúng JSON schema.',
+        },
+        {
+          role: 'user',
+          content: `Hãy liệt kê đầy đủ mọi câu/ý (vd: Câu 1a, Câu 1b...) cùng điểm tối đa (maxScore) và đáp án ngắn gọn (expectedAnswer) sao cho tổng maxScore = 10.0:\n\n${combinedRefText}`,
+          ...(refImgs.length > 0 ? { images: refImgs.slice(0, 3) } : {}),
+        },
+      ],
+      stream: false,
+      think: false,
+      keep_alive: '10m',
+      format: OLLAMA_RUBRIC_SCHEMA,
+      options: {
+        temperature: 0.0,
+        seed: 42,
+        top_k: 1,
+        repeat_penalty: 1.0,
+        num_ctx: 8192,
+        num_predict: 1024,
+      },
+    };
+
+    const data = await callOllamaApi(ollamaConfig, '/api/chat', payload, combinedRefText.length > 40);
+    const raw = data?.message?.content || data?.response || '';
+    if (raw) {
+      const parsed = stripThinkingAndParseJson(raw);
+      const items = Array.isArray(parsed?.items) ? parsed.items : [];
+      const valid = items.filter((it: any) => it?.question && Number(it?.maxScore) > 0);
+      const total = valid.reduce((acc: number, it: any) => acc + Number(it.maxScore), 0);
+      if (valid.length >= 2 && total >= 9.0 && total <= 10.5) {
+        const formatted = valid
+          .map((it: any) => `- ${String(it.question).trim()}: Thang điểm tối đa ${Number(it.maxScore)}`)
+          .join('\n');
+        rubricExtractionCache.set(cacheKey, formatted);
+        return formatted;
+      }
+    }
+  } catch (err) {
+    console.warn('Không thể trích xuất barem tự động trước chấm bài:', err);
+  }
+
+  return '';
 };
 
 export const generateExamContentOllama = async (
@@ -553,36 +725,39 @@ export const gradeSingleSubmissionOllama = async (
   examCode?: string;
 }> => {
   const images: string[] = [];
+  const referenceImages: string[] = [];
   let extraText = '';
   let submissionHasText = true;
   let examNormalizedText = '';
+  let examRawText = '';
+  let answerKeyRawText = '';
 
-  if (options?.masterRubric && options.masterRubric.trim()) {
-    extraText += `\n[BẢNG BAREM THANG ĐIỂM BẮT BUỘC DÙNG CHUNG CHO TẤT CẢ CÁC BÀI THI]:\n${options.masterRubric.trim()}\n\nQUY TẮC CỐ ĐỊNH BAREM: Bắt buộc tạo đủ TẤT CẢ các phần tử tương ứng trong mảng "questionRows" với đúng tên câu và đúng "maxScore". Câu nào thí sinh không giải/bỏ trống bắt buộc ghi studentAnswer: "Bỏ trống", isFinalCorrect: "Không làm", gradingMethod: "Bỏ trống", earnedScore: 0.\n`;
-  }
+  // 1. Extract submission FIRST (so Image 1 is the upright rotated Phách crop, followed by Pages 1..5)
+  const subRes = await appendFileForOllama(submissionFile, 'TÀI LIỆU BÀI LÀM CỦA THÍ SINH', images, {
+    maxPdfRenderPages: 5,
+    onlyRenderIfNoText: false,
+    includePhachCrop: true,
+  });
+  extraText += subRes.textBlock;
+  submissionHasText = subRes.hasExtractedText;
 
+  // 2. Extract Exam Question file & text
   if (options?.examQuestionFile) {
-    // Exam question docs typically contain selectable text; skip heavy JPEG rendering unless scanned
-    const qRes = await appendFileForOllama(options.examQuestionFile, 'TỆP ĐỀ BÀI (ĐỀ THI GỐC)', images, {
+    const qRes = await appendFileForOllama(options.examQuestionFile, 'TỆP ĐỀ BÀI (ĐỀ THI GỐC)', referenceImages, {
       maxPdfRenderPages: 4,
       onlyRenderIfNoText: true,
     });
     extraText += qRes.textBlock;
     examNormalizedText = qRes.normalizedText;
+    examRawText = qRes.rawText;
+    referenceImages.forEach((b64) => images.push(b64));
   }
 
   if (options?.examQuestionText && options.examQuestionText.trim()) {
     extraText += `\n[NỘI DUNG ĐỀ BÀI (ĐỀ THI GỐC) ĐƯỢC GIÁO VIÊN CUNG CẤP]:\n${options.examQuestionText.trim()}\n`;
   }
 
-  // Always render up to 4 pages of the student's PDF submission so handwriting & circled answers are visible
-  const subRes = await appendFileForOllama(submissionFile, 'TÀI LIỆU BÀI LÀM CỦA THÍ SINH', images, {
-    maxPdfRenderPages: 4,
-    onlyRenderIfNoText: false,
-  });
-  extraText += subRes.textBlock;
-  submissionHasText = subRes.hasExtractedText;
-
+  // 3. Extract Answer Key file (deduplicated against examQuestionFile) & text
   if (answerKeyFile) {
     const isSameMetadata =
       options?.examQuestionFile &&
@@ -590,29 +765,51 @@ export const gradeSingleSubmissionOllama = async (
       answerKeyFile.size === options.examQuestionFile.size;
 
     if (isSameMetadata) {
-      extraText += `\n--- [TỆP ĐÁP ÁN CHUẨN] File "${answerKeyFile.name}" ---\n(Trùng với tệp đề bài đã đính kèm ở trên — hãy dùng cả phần đề và đáp án/hướng dẫn chấm trong tệp đó).\n`;
+      answerKeyRawText = examRawText;
+      extraText += `\n--- [TỆP ĐÁP ÁN CHUẨN] File "${answerKeyFile.name}" ---\n(Trùng với tệp đề bài đã đính kèm — dùng cả phần đề và đáp án/hướng dẫn chấm trong tệp đó).\n`;
     } else {
       const tempImages: string[] = [];
       const kRes = await appendFileForOllama(answerKeyFile, 'TỆP ĐÁP ÁN CHUẨN & THANG ĐIỂM ĐỐI CHIẾU', tempImages, {
         maxPdfRenderPages: 4,
         onlyRenderIfNoText: true,
       });
+      answerKeyRawText = kRes.rawText;
       const isDuplicateText =
         Boolean(examNormalizedText) &&
         Boolean(kRes.normalizedText) &&
         kRes.normalizedText === examNormalizedText;
 
       if (isDuplicateText) {
-        extraText += `\n--- [TỆP ĐÁP ÁN CHUẨN] File "${answerKeyFile.name}" ---\n(Nội dung trùng với tệp đề bài đã đính kèm ở trên).\n`;
+        extraText += `\n--- [TỆP ĐÁP ÁN CHUẨN] File "${answerKeyFile.name}" ---\n(Nội dung trùng với tệp đề bài đã đính kèm).\n`;
       } else {
         extraText += kRes.textBlock;
-        tempImages.forEach((b64) => images.push(b64));
+        tempImages.forEach((b64) => {
+          referenceImages.push(b64);
+          images.push(b64);
+        });
       }
     }
   }
 
   if (options?.answerKeyText && options.answerKeyText.trim()) {
     extraText += `\n[NỘI DUNG ĐÁP ÁN CHUẨN & THANG ĐIỂM ĐƯỢC GIÁO VIÊN CUNG CẤP]:\n${options.answerKeyText.trim()}\n`;
+  }
+
+  // 4. Lock Master Rubric BEFORE grading even the 1st student
+  const effectiveMasterRubric = await ensureMasterRubricForOllama(ollamaConfig, {
+    existingMasterRubric: options?.masterRubric,
+    answerKeyRawText,
+    examQuestionRawText: examRawText,
+    answerKeyTextArg: options?.answerKeyText,
+    examQuestionTextArg: options?.examQuestionText,
+    referenceImages,
+  });
+
+  if (effectiveMasterRubric) {
+    extraText =
+      `\n[BẢNG BAREM THANG ĐIỂM BẮT BUỘC DÙNG CHUNG — TỔNG 10.0 ĐIỂM]:\n${effectiveMasterRubric}\n` +
+      `\nQUY TẮC BẮT BUỘC VỀ BAREM: Phải tạo đủ ĐÚNG các dòng trong "questionRows" khớp 100% các câu trên với đúng "maxScore". Câu nào không thấy thí sinh giải trong các trang bài làm -> studentAnswer: "Bỏ trống", isFinalCorrect: "Không làm", gradingMethod: "Bỏ trống", earnedScore: 0.\n` +
+      extraText;
   }
 
   const fastRule = options?.fastFinalResultGrading !== false;
@@ -624,39 +821,26 @@ export const gradeSingleSubmissionOllama = async (
     fastFinalResultGrading: fastRule,
   });
 
-  const systemInstruction = `${GRADING_SYSTEM_INSTRUCTION}
-
-QUY ĐỊNH XUẤT DỮ LIỆU CÓ CẤU TRÚC CHO HỆ THỐNG (QUAN TRỌNG):
-- Thay vì tự vẽ bảng Markdown bằng tay (dễ vỡ cột/sai phép cộng), bạn PHẢI trả về đầy đủ mảng "questionRows" trong JSON. Hệ thống sẽ tự động tính tổng điểm chính xác và dựng Phiếu chấm điểm chuẩn Đại học từ mảng này.
-- Với MỖI câu / ý trong đề thi (từ Câu 1 đến câu cuối cùng, tổng maxScore toàn bài đúng bằng 10.0), tạo 1 object trong "questionRows":
-  * "question": Tên câu / ý ngắn gọn khớp barem (vd: "Câu 1a", "Câu 1b", "Câu 2a"...).
-  * "requirement": Tóm tắt ngắn yêu cầu của câu.
-  * "studentAnswer": Đáp án / kết quả cuối thí sinh làm được (nếu không làm ghi "Bỏ trống").
-  * "isFinalCorrect": Chỉ ghi ngắn gọn "Đúng", "Sai", "Thiếu", hoặc "Không làm".
-  * "gradingMethod": Chỉ ghi "Trọn điểm (Đúng KQ cuối)", "Chấm thành phần (Sai KQ cuối)", hoặc "Bỏ trống".
-  * "maxScore": Số điểm tối đa của câu/ý (kiểu số, vd: 2.5).
-  * "earnedScore": Số điểm thí sinh đạt được từ 0 đến maxScore (kiểu số, bước 0.25, vd: 1.75; nếu "Không làm" bắt buộc = 0).
-  * "comment": Nhận xét ngắn gọn lý do trừ điểm hoặc các bước đúng thành phần.`;
-
   const userPrompt = `${extraText}\n${userGradingRequirements}\n
 BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn bản hay bảng Markdown bên ngoài):
 {
   "students": [
     {
-      "studentName": "Họ và tên thí sinh trích xuất từ bài thi",
+      "studentName": "Họ và tên viết tay trên PHÁCH/trang 1 (vd: Ngô Quang Huy; nếu thực sự không có ghi rỗng '')",
       "studentId": "MSSV hoặc SBD nếu có (nếu không ghi 'Không có')",
-      "className": "Lớp nếu có (nếu không ghi 'Không có')",
-      "examCode": "Mã đề nếu có (nếu không ghi 'Không có')",
+      "className": "Lớp nếu có (vd: ĐHCN7; nếu không ghi 'Không có')",
+      "examCode": "Mã đề nếu có (vd: Đề 2; nếu không ghi 'Không có')",
       "questionRows": [
         {
           "question": "Câu 1a",
-          "requirement": "Tính vận tốc tức thời...",
-          "studentAnswer": "v = 12 m/s",
+          "requirement": "Tìm phương trình quỹ đạo...",
+          "expectedAnswer": "Elip x^2/16 + y^2/9 = 1",
+          "studentAnswer": "x^2/16 + y^2/9 = 1, kết luận elip a=4m, b=3m (hoặc 'Bỏ trống' nếu không làm)",
           "isFinalCorrect": "Đúng",
           "gradingMethod": "Trọn điểm (Đúng KQ cuối)",
-          "maxScore": 2.5,
-          "earnedScore": 2.5,
-          "comment": "Lời giải đầy đủ và đáp số chính xác."
+          "maxScore": 1.5,
+          "earnedScore": 1.5,
+          "comment": "Lời giải đúng phương pháp và kết quả cuối."
         }
       ],
       "strengths": "Tóm tắt ưu điểm chính của bài làm",
@@ -666,7 +850,7 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
 }`;
 
   const messages: any[] = [
-    { role: 'system', content: systemInstruction },
+    { role: 'system', content: OLLAMA_GRADING_SYSTEM_INSTRUCTION },
     {
       role: 'user',
       content: userPrompt,
@@ -692,7 +876,13 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
     },
   };
 
-  const defaultName = studentName || submissionFile.name.replace(/\.[^/.]+$/, '');
+  const cleanFileBase = submissionFile.name.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ').trim();
+  const cleanPassedName = sanitizeStudentField(
+    String(studentName || '').replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ').trim(),
+    'name'
+  );
+  const defaultName = cleanPassedName || cleanFileBase || 'Thí sinh';
+
   let parsed: any = null;
   let lastRawContent = '';
   let lastError: any = null;
@@ -728,15 +918,16 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
         ? parsed.students
         : [parsed];
 
-    const finalStudents = rawStudents.map((rawSt) => {
+    const finalStudents = rawStudents.map((rawSt, idx) => {
+      const rowFallbackName = rawStudents.length > 1 ? `${defaultName} (Bài ${idx + 1})` : defaultName;
       if (Array.isArray(rawSt?.questionRows) && rawSt.questionRows.length > 0) {
-        return formatGradingFeedbackFromStructured(rawSt, defaultName, options?.masterRubric);
+        return formatGradingFeedbackFromStructured(rawSt, rowFallbackName, effectiveMasterRubric || undefined);
       }
       const legacyStudent = {
-        studentName: rawSt?.studentName || defaultName,
-        studentId: rawSt?.studentId || '',
-        className: rawSt?.className || '',
-        examCode: rawSt?.examCode || '',
+        studentName: sanitizeStudentField(rawSt?.studentName, 'name') || rowFallbackName,
+        studentId: sanitizeStudentField(rawSt?.studentId, 'meta') || 'Không có',
+        className: sanitizeStudentField(rawSt?.className, 'meta') || 'Không có',
+        examCode: sanitizeStudentField(rawSt?.examCode, 'meta') || 'Không có',
         score: rawSt?.score || 'N/A',
         totalScoreNum: rawSt?.totalScoreNum,
         scoreText: rawSt?.scoreText || '',
@@ -751,7 +942,7 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
       students: finalStudents,
       content: first.feedback,
       score: first.score,
-      studentName: first.studentName || defaultName,
+      studentName: sanitizeStudentField(first.studentName, 'name') || defaultName,
       studentId: first.studentId,
       className: first.className,
       examCode: first.examCode,

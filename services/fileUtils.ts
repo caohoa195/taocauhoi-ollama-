@@ -32,15 +32,141 @@ const fileContentCache = new WeakMap<File, Promise<{
 const pdfOllamaCache = new Map<string, Promise<{
   text: string;
   images: string[];
+  headerImages: string[];
   pageCount: number;
 }>>();
 
+const reconstructPdfPageText = (items: any[]): string => {
+  if (!Array.isArray(items) || items.length === 0) return '';
+  const lines: string[] = [];
+  let currentLine = '';
+  let prevY: number | null = null;
+  let prevEndX: number | null = null;
+  let prevFontSize = 10;
+
+  for (const item of items) {
+    if (!item || typeof item.str !== 'string') continue;
+    const str = item.str;
+    const transform = Array.isArray(item.transform) ? item.transform : null;
+    const fontSize = transform
+      ? Math.max(6, Math.hypot(transform[0] || 0, transform[1] || 0) || Math.abs(transform[3] || 0) || 10)
+      : prevFontSize;
+    const x = transform ? Number(transform[4]) : null;
+    const y = transform ? Number(transform[5]) : null;
+    const width = typeof item.width === 'number' ? item.width : str.length * fontSize * 0.45;
+
+    if (prevY !== null && y !== null && Math.abs(y - prevY) > Math.max(3, fontSize * 0.45)) {
+      if (currentLine.trim()) lines.push(currentLine.trim());
+      currentLine = str;
+      prevY = y;
+      prevEndX = x !== null ? x + width : null;
+      prevFontSize = fontSize;
+      continue;
+    }
+
+    if (currentLine.length > 0 && x !== null && prevEndX !== null) {
+      const gap = x - prevEndX;
+      if (gap > fontSize * 3.0 && !currentLine.endsWith('|') && str.trim()) {
+        currentLine += ' | ' + str;
+      } else if (gap > Math.max(1.2, fontSize * 0.18) && !/\s$/.test(currentLine) && !/^\s/.test(str)) {
+        currentLine += ' ' + str;
+      } else {
+        currentLine += str;
+      }
+    } else {
+      currentLine += str;
+    }
+
+    if (item.hasEOL) {
+      if (currentLine.trim()) lines.push(currentLine.trim());
+      currentLine = '';
+      prevY = null;
+      prevEndX = null;
+    } else {
+      if (y !== null) prevY = y;
+      if (x !== null) prevEndX = x + width;
+      prevFontSize = fontSize;
+    }
+  }
+
+  if (currentLine.trim()) lines.push(currentLine.trim());
+  return lines.join('\n').replace(/[ \t]{2,}/g, ' ').trim();
+};
+
+const renderRightPhachCropUpright = (srcCanvas: HTMLCanvasElement): string | null => {
+  try {
+    if (typeof document === 'undefined' || srcCanvas.width < 100 || srcCanvas.height < 100) return null;
+    // Standard Vietnamese exam sheets print Phách (Họ tên, Lớp, SBD) vertically along the right ~36% margin, rotated 90° clockwise.
+    // Rotating that right strip -90° (counter-clockwise) restores text upright left-to-right.
+    const sx = Math.floor(srcCanvas.width * 0.62);
+    const sw = srcCanvas.width - sx;
+    const sh = srcCanvas.height;
+    if (sw <= 20 || sh <= 20) return null;
+
+    const cropCanvas = document.createElement('canvas');
+    cropCanvas.width = sh;
+    cropCanvas.height = sw;
+    const cropCtx = cropCanvas.getContext('2d');
+    if (!cropCtx) return null;
+
+    cropCtx.fillStyle = '#FFFFFF';
+    cropCtx.fillRect(0, 0, cropCanvas.width, cropCanvas.height);
+    cropCtx.translate(0, cropCanvas.height);
+    cropCtx.rotate(-Math.PI / 2);
+    cropCtx.drawImage(srcCanvas, sx, 0, sw, sh, 0, 0, sw, sh);
+
+    const dataUrl = cropCanvas.toDataURL('image/jpeg', 0.9);
+    return dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+  } catch (err) {
+    console.warn('Could not create upright phach crop:', err);
+    return null;
+  }
+};
+
+export const extractPortraitPhachImageCrop = async (file: File): Promise<string | null> => {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return null;
+  if (!file.type.startsWith('image/') && !/\.(jpe?g|png|webp|bmp)$/i.test(file.name)) return null;
+
+  return new Promise((resolve) => {
+    const img = new Image();
+    const objectUrl = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl);
+      if (img.height <= img.width) {
+        resolve(null);
+        return;
+      }
+      const targetMax = 1600;
+      const scale = Math.min(1, targetMax / Math.max(img.width, img.height, 1));
+      const w = Math.max(1, Math.round(img.width * scale));
+      const h = Math.max(1, Math.round(img.height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(null);
+        return;
+      }
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(img, 0, 0, w, h);
+      resolve(renderRightPhachCropUpright(canvas));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(null);
+    };
+    img.src = objectUrl;
+  });
+};
+
 export const extractPdfForOllama = async (
   file: File,
-  maxRenderPages = 4,
+  maxRenderPages = 5,
   onlyRenderIfNoText = false
-): Promise<{ text: string; images: string[]; pageCount: number }> => {
-  const cacheKey = `${file.name}:${file.size}:${file.lastModified}:${maxRenderPages}:${onlyRenderIfNoText ? 1 : 0}`;
+): Promise<{ text: string; images: string[]; headerImages: string[]; pageCount: number }> => {
+  const cacheKey = `${file.name}:${file.size}:${file.lastModified}:${maxRenderPages}:${onlyRenderIfNoText ? 1 : 0}:v2`;
   const existing = pdfOllamaCache.get(cacheKey);
   if (existing) {
     return existing;
@@ -61,13 +187,9 @@ export const extractPdfForOllama = async (
       pages.push(page);
       try {
         const textContent = await page.getTextContent();
-        const pageText = (textContent.items || [])
-          .map((item: any) => ('str' in item ? item.str : ''))
-          .join(' ')
-          .replace(/\s+/g, ' ')
-          .trim();
+        const pageText = reconstructPdfPageText(textContent.items || []);
         if (pageText) {
-          textParts.push(`[Trang ${p}]: ${pageText}`);
+          textParts.push(`[Trang ${p}]:\n${pageText}`);
         }
       } catch (txtErr) {
         console.warn(`Could not extract text from page ${p} of ${file.name}:`, txtErr);
@@ -76,6 +198,7 @@ export const extractPdfForOllama = async (
 
     const combinedText = textParts.join('\n').trim();
     const images: string[] = [];
+    const headerImages: string[] = [];
     const shouldRenderImages = !onlyRenderIfNoText || combinedText.length < 80;
 
     if (shouldRenderImages && typeof document !== 'undefined') {
@@ -85,7 +208,9 @@ export const extractPdfForOllama = async (
         try {
           const baseViewport = page.getViewport({ scale: 1 });
           const maxDim = Math.max(baseViewport.width, baseViewport.height, 1);
-          const scale = Math.min(2.0, Math.max(1.0, 1200 / maxDim));
+          // Render Page 1 slightly higher (1500px) to preserve handwritten formulas and Phách header details
+          const targetMax = i === 0 && !onlyRenderIfNoText ? 1500 : 1200;
+          const scale = Math.min(2.5, Math.max(1.0, targetMax / maxDim));
           const viewport = page.getViewport({ scale });
 
           const canvas = document.createElement('canvas');
@@ -96,7 +221,14 @@ export const extractPdfForOllama = async (
             ctx.fillStyle = '#FFFFFF';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
             await page.render({ canvasContext: ctx, viewport, canvas } as any).promise;
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+
+            // On Page 1 of student submissions, extract upright rotated right-strip Phách header
+            if (i === 0 && !onlyRenderIfNoText && canvas.height > canvas.width) {
+              const phachB64 = renderRightPhachCropUpright(canvas);
+              if (phachB64) headerImages.push(phachB64);
+            }
+
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
             const b64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
             if (b64) images.push(b64);
           }
@@ -109,6 +241,7 @@ export const extractPdfForOllama = async (
     return {
       text: combinedText,
       images,
+      headerImages,
       pageCount,
     };
   })();
