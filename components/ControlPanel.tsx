@@ -2,6 +2,9 @@ import React, { useState, useEffect } from 'react';
 import {
   QuestionType,
   DifficultyLevel,
+  DifficultyMatrixCounts,
+  ObjectiveSubQuestionType,
+  ObjectiveMatrixSection,
   ExamConfig,
   GradingConfig,
   AIProvider,
@@ -123,15 +126,15 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
   const [copiedCmd, setCopiedCmd] = useState<string | null>(null);
 
   // Header Info State
-  const [faculty, setFaculty] = useState('Công nghệ thông tin');
-  const [department, setDepartment] = useState('Khoa học máy tính');
-  const [targetAudience, setTargetAudience] = useState('Sinh viên đại học chính quy');
+  const [faculty, setFaculty] = useState('Cơ bản');
+  const [department, setDepartment] = useState('Toán - Lý');
+  const [targetAudience, setTargetAudience] = useState('ĐHCN6');
   const [duration, setDuration] = useState('60');
   const [signerTitle, setSignerTitle] = useState('TRƯỞNG BỘ MÔN');
   const [signerName, setSignerName] = useState('Nguyễn Văn A');
 
   // Generation State
-  const [subject, setSubject] = useState<string>('Vật lý');
+  const [subject, setSubject] = useState<string>('Vật lý đại cương');
   const [topic, setTopic] = useState('');
   const [specific, setSpecific] = useState('');
   const [qType, setQType] = useState<QuestionType>(QuestionType.MULTIPLE_CHOICE);
@@ -140,12 +143,37 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
 
   // Matrix State (For Essay)
   const [variantCount, setVariantCount] = useState(1);
-  const [matrixCounts, setMatrixCounts] = useState({
+  const [matrixCounts, setMatrixCounts] = useState<DifficultyMatrixCounts>({
     [DifficultyLevel.RECOGNITION]: 1,
     [DifficultyLevel.UNDERSTANDING]: 1,
     [DifficultyLevel.APPLICATION]: 1,
     [DifficultyLevel.ADVANCED_APPLICATION]: 0,
   });
+
+  // Objective Matrix State (For Combined Mixed Objective Exam: 4 options, True/False, Fill-blank x 4 difficulty levels)
+  const [objectiveMatrix, setObjectiveMatrix] = useState<
+    Record<ObjectiveSubQuestionType, DifficultyMatrixCounts>
+  >({
+    [QuestionType.MULTIPLE_CHOICE]: {
+      [DifficultyLevel.RECOGNITION]: 4,
+      [DifficultyLevel.UNDERSTANDING]: 3,
+      [DifficultyLevel.APPLICATION]: 2,
+      [DifficultyLevel.ADVANCED_APPLICATION]: 1,
+    },
+    [QuestionType.TRUE_FALSE]: {
+      [DifficultyLevel.RECOGNITION]: 1,
+      [DifficultyLevel.UNDERSTANDING]: 1,
+      [DifficultyLevel.APPLICATION]: 1,
+      [DifficultyLevel.ADVANCED_APPLICATION]: 1,
+    },
+    [QuestionType.FILL_BLANK]: {
+      [DifficultyLevel.RECOGNITION]: 2,
+      [DifficultyLevel.UNDERSTANDING]: 1,
+      [DifficultyLevel.APPLICATION]: 1,
+      [DifficultyLevel.ADVANCED_APPLICATION]: 0,
+    },
+  });
+  const [genError, setGenError] = useState<string | null>(null);
 
   // Source Files State (Array)
   const [sourceFiles, setSourceFiles] = useState<File[]>([]);
@@ -182,12 +210,48 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
     setTimeout(() => setCopiedCmd(null), 2000);
   };
 
+  const OBJECTIVE_SUB_TYPES: ObjectiveSubQuestionType[] = [
+    QuestionType.MULTIPLE_CHOICE,
+    QuestionType.TRUE_FALSE,
+    QuestionType.FILL_BLANK,
+  ];
+
+  const getObjectiveTypeTotal = (type: ObjectiveSubQuestionType): number => {
+    const counts = objectiveMatrix[type];
+    return (
+      (counts[DifficultyLevel.RECOGNITION] || 0) +
+      (counts[DifficultyLevel.UNDERSTANDING] || 0) +
+      (counts[DifficultyLevel.APPLICATION] || 0) +
+      (counts[DifficultyLevel.ADVANCED_APPLICATION] || 0)
+    );
+  };
+
+  const totalObjectiveQuestions = OBJECTIVE_SUB_TYPES.reduce(
+    (sum, type) => sum + getObjectiveTypeTotal(type),
+    0
+  );
+
   const handleGenerate = () => {
     const isEssay = qType === QuestionType.ESSAY;
+    const isMixedObjective = qType === QuestionType.MIXED_OBJECTIVE;
+
+    const objectiveSections: ObjectiveMatrixSection[] = OBJECTIVE_SUB_TYPES.map((type) => ({
+      type,
+      counts: objectiveMatrix[type],
+    }));
+
     const finalQuantity = isEssay
       ? Object.values(matrixCounts).reduce((a: number, b: number) => a + b, 0)
+      : isMixedObjective
+      ? totalObjectiveQuestions
       : quantity;
 
+    if (finalQuantity <= 0) {
+      setGenError('Vui lòng nhập ít nhất 1 câu hỏi để tạo đề.');
+      return;
+    }
+
+    setGenError(null);
     onGenerate({
       subject,
       topic,
@@ -203,7 +267,8 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
       signerTitle,
       signerName,
       levelDistribution: isEssay ? matrixCounts : undefined,
-      variantCount: isEssay ? variantCount : 1,
+      objectiveMatrix: isMixedObjective ? objectiveSections : undefined,
+      variantCount: isEssay || isMixedObjective ? variantCount : 1,
     });
   };
 
@@ -297,7 +362,24 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
   };
 
   const updateMatrixCount = (lvl: DifficultyLevel, val: number) => {
-    setMatrixCounts((prev) => ({ ...prev, [lvl]: val >= 0 ? val : 0 }));
+    setGenError(null);
+    setMatrixCounts((prev) => ({ ...prev, [lvl]: val >= 0 ? Math.floor(val) : 0 }));
+  };
+
+  const updateObjectiveMatrixCount = (
+    type: ObjectiveSubQuestionType,
+    lvl: DifficultyLevel,
+    val: number
+  ) => {
+    setGenError(null);
+    const safeVal = Number.isFinite(val) && val >= 0 ? Math.floor(val) : 0;
+    setObjectiveMatrix((prev) => ({
+      ...prev,
+      [type]: {
+        ...prev[type],
+        [lvl]: safeVal,
+      },
+    }));
   };
 
 
@@ -726,7 +808,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
                     value={faculty}
                     onChange={(e) => setFaculty(e.target.value)}
                     className="w-full p-1.5 text-xs border rounded bg-white"
-                    placeholder="VD: CNTT"
+                    placeholder="VD: Cơ bản"
                   />
                 </div>
                 <div>
@@ -738,7 +820,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
                     value={department}
                     onChange={(e) => setDepartment(e.target.value)}
                     className="w-full p-1.5 text-xs border rounded bg-white"
-                    placeholder="VD: KHMT"
+                    placeholder="VD: Toán - Lý"
                   />
                 </div>
               </div>
@@ -802,7 +884,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
                 type="text"
                 value={subject}
                 onChange={(e) => setSubject(e.target.value)}
-                placeholder="Ví dụ: Vật lý, Toán học đại cương..."
+                placeholder="Ví dụ: Vật lý đại cương, Toán học đại cương..."
                 className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm text-gray-800 font-medium"
               />
             </div>
@@ -897,7 +979,7 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
               </select>
             </div>
 
-            {/* CONDITIONAL RENDERING: Matrix Mode for Essay vs Simple Mode for others */}
+            {/* CONDITIONAL RENDERING: Essay Matrix vs Combined Objective Matrix vs Simple Single-Type Mode */}
             {qType === QuestionType.ESSAY ? (
               <div className="bg-gradient-to-br from-indigo-50 to-white p-3 rounded-lg border border-indigo-200 animate-fadeIn">
                 <h3 className="text-xs font-bold text-indigo-700 uppercase mb-3 flex items-center gap-1">
@@ -928,12 +1010,87 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
                     min={1}
                     max={5}
                     value={variantCount}
-                    onChange={(e) => setVariantCount(Number(e.target.value))}
+                    onChange={(e) => setVariantCount(Math.min(5, Math.max(1, Number(e.target.value) || 1)))}
                     className="w-16 p-1 text-center text-sm font-bold border border-indigo-300 rounded bg-white"
                   />
                 </div>
                 <p className="text-[10px] text-gray-400 mt-1 italic text-right">
                   *Tối đa 5 đề một lần
+                </p>
+              </div>
+            ) : qType === QuestionType.MIXED_OBJECTIVE ? (
+              <div className="bg-gradient-to-br from-blue-50 to-white p-3 rounded-lg border border-blue-200 space-y-3 animate-fadeIn">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-bold text-blue-800 uppercase flex items-center gap-1">
+                    <Layers size={14} /> Ma trận Trắc nghiệm tổng hợp
+                  </h3>
+                  <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-blue-100 text-blue-800">
+                    Tổng: {totalObjectiveQuestions} câu
+                  </span>
+                </div>
+
+                <div className="space-y-2.5">
+                  {OBJECTIVE_SUB_TYPES.map((subType) => {
+                    const subTotal = getObjectiveTypeTotal(subType);
+                    return (
+                      <div
+                        key={subType}
+                        className="bg-white p-2.5 rounded-lg border border-blue-100 shadow-xs"
+                      >
+                        <div className="flex items-center justify-between mb-2 pb-1.5 border-b border-gray-100">
+                          <span className="text-xs font-bold text-gray-800">{subType}</span>
+                          <span
+                            className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${
+                              subTotal > 0
+                                ? 'bg-indigo-50 text-indigo-700'
+                                : 'bg-gray-100 text-gray-500'
+                            }`}
+                          >
+                            {subTotal} câu
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+                          {Object.values(DifficultyLevel).map((lvl) => (
+                            <div key={lvl} className="flex items-center justify-between gap-1">
+                              <label
+                                className="text-[11px] text-gray-600 truncate"
+                                title={lvl}
+                              >
+                                {lvl}
+                              </label>
+                              <input
+                                type="number"
+                                min={0}
+                                max={50}
+                                value={objectiveMatrix[subType][lvl]}
+                                onChange={(e) =>
+                                  updateObjectiveMatrixCount(subType, lvl, Number(e.target.value))
+                                }
+                                className="w-12 p-1 text-center text-xs font-medium border border-gray-300 rounded focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="pt-2 border-t border-blue-100 flex justify-between items-center">
+                  <label className="text-xs font-bold text-blue-800 uppercase">
+                    Số lượng mã đề
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={5}
+                    value={variantCount}
+                    onChange={(e) => setVariantCount(Math.min(5, Math.max(1, Number(e.target.value) || 1)))}
+                    className="w-16 p-1 text-center text-sm font-bold border border-blue-300 rounded bg-white"
+                  />
+                </div>
+                <p className="text-[10px] text-gray-500 italic text-right">
+                  *Đặt 0 ở dạng/mức độ không dùng • Tối đa 5 mã đề
                 </p>
               </div>
             ) : (
@@ -963,10 +1120,19 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
                     min={1}
                     max={50}
                     value={quantity}
-                    onChange={(e) => setQuantity(Number(e.target.value))}
+                    onChange={(e) => {
+                      setGenError(null);
+                      setQuantity(Number(e.target.value));
+                    }}
                     className="w-full p-2.5 bg-gray-50 border border-gray-200 rounded-lg outline-none text-sm"
                   />
                 </div>
+              </div>
+            )}
+
+            {genError && (
+              <div className="p-2.5 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 font-medium">
+                {genError}
               </div>
             )}
 

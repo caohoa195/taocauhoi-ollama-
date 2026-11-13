@@ -8,6 +8,7 @@ export enum QuestionType {
   MULTIPLE_CHOICE = 'Trắc nghiệm 4 phương án',
   TRUE_FALSE = 'Đúng/Sai',
   FILL_BLANK = 'Điền vào chỗ trống',
+  MIXED_OBJECTIVE = 'Trắc nghiệm tổng hợp (4 đáp án, Đúng/Sai, Điền khuyết)',
   ESSAY = 'Tự luận',
 }
 
@@ -16,6 +17,23 @@ export enum DifficultyLevel {
   UNDERSTANDING = 'Thông hiểu',
   APPLICATION = 'Vận dụng',
   ADVANCED_APPLICATION = 'Vận dụng nâng cao',
+}
+
+export interface DifficultyMatrixCounts {
+  [DifficultyLevel.RECOGNITION]: number;
+  [DifficultyLevel.UNDERSTANDING]: number;
+  [DifficultyLevel.APPLICATION]: number;
+  [DifficultyLevel.ADVANCED_APPLICATION]: number;
+}
+
+export type ObjectiveSubQuestionType =
+  | QuestionType.MULTIPLE_CHOICE
+  | QuestionType.TRUE_FALSE
+  | QuestionType.FILL_BLANK;
+
+export interface ObjectiveMatrixSection {
+  type: ObjectiveSubQuestionType;
+  counts: DifficultyMatrixCounts;
 }
 
 export interface ExamConfig {
@@ -34,12 +52,8 @@ export interface ExamConfig {
   signerTitle: string;
   signerName: string;
   // Matrix Fields
-  levelDistribution?: {
-    [DifficultyLevel.RECOGNITION]: number;
-    [DifficultyLevel.UNDERSTANDING]: number;
-    [DifficultyLevel.APPLICATION]: number;
-    [DifficultyLevel.ADVANCED_APPLICATION]: number;
-  };
+  levelDistribution?: DifficultyMatrixCounts;
+  objectiveMatrix?: ObjectiveMatrixSection[];
   variantCount?: number;
 }
 

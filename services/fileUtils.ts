@@ -1,5 +1,12 @@
 // Helper for extracting text from diverse document formats (DOCX, TXT, MD, CSV, etc.)
-// Uses mammoth for client-side .docx parsing
+// Uses mammoth for client-side .docx parsing and pdfjs-dist for client-side PDF text + page image rendering
+import * as pdfjsLib from 'pdfjs-dist';
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+
+if (typeof window !== 'undefined' && pdfjsLib?.GlobalWorkerOptions) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+}
+
 let mammothModule: any = null;
 
 const loadMammoth = async () => {
@@ -21,6 +28,82 @@ const fileContentCache = new WeakMap<File, Promise<{
   base64?: string;
   mimeType: string;
 }>>();
+
+const pdfOllamaCache = new WeakMap<File, Promise<{
+  text: string;
+  images: string[];
+  pageCount: number;
+}>>();
+
+export const extractPdfForOllama = async (
+  file: File,
+  maxRenderPages = 6
+): Promise<{ text: string; images: string[]; pageCount: number }> => {
+  if (pdfOllamaCache.has(file)) {
+    return pdfOllamaCache.get(file)!;
+  }
+
+  const promise = (async () => {
+    const arrayBuffer = await file.arrayBuffer();
+    const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) });
+    const pdf = await loadingTask.promise;
+    const pageCount = pdf.numPages || 0;
+
+    const textParts: string[] = [];
+    const images: string[] = [];
+
+    const maxTextPages = Math.min(pageCount, 20);
+    for (let p = 1; p <= maxTextPages; p++) {
+      const page = await pdf.getPage(p);
+      try {
+        const textContent = await page.getTextContent();
+        const pageText = (textContent.items || [])
+          .map((item: any) => ('str' in item ? item.str : ''))
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (pageText) {
+          textParts.push(`[Trang ${p}]: ${pageText}`);
+        }
+      } catch (txtErr) {
+        console.warn(`Could not extract text from page ${p} of ${file.name}:`, txtErr);
+      }
+
+      if (p <= maxRenderPages && typeof document !== 'undefined') {
+        try {
+          const baseViewport = page.getViewport({ scale: 1 });
+          const maxDim = Math.max(baseViewport.width, baseViewport.height, 1);
+          const scale = Math.min(2.0, Math.max(1.0, 1400 / maxDim));
+          const viewport = page.getViewport({ scale });
+
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(viewport.width);
+          canvas.height = Math.round(viewport.height);
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            await page.render({ canvasContext: ctx, viewport, canvas } as any).promise;
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+            const b64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
+            if (b64) images.push(b64);
+          }
+        } catch (renderErr) {
+          console.warn(`Could not render page ${p} of ${file.name} for Ollama:`, renderErr);
+        }
+      }
+    }
+
+    return {
+      text: textParts.join('\n').trim(),
+      images,
+      pageCount,
+    };
+  })();
+
+  pdfOllamaCache.set(file, promise);
+  return promise;
+};
 
 
 export const extractFileContent = async (file: File): Promise<{

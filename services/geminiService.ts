@@ -1,5 +1,6 @@
-import { ExamConfig, GradingConfig, FileData, QuestionType, DifficultyLevel } from "../types";
+import { ExamConfig, GradingConfig } from "../types";
 import { extractFileContent } from "./fileUtils";
+import { buildExamMetaAndPrompt, buildGradingUserPrompt } from "../utils/examHelpers";
 
 export const fileToGenerativePart = async (file: File): Promise<any> => {
 
@@ -42,125 +43,83 @@ export const generateExamContent = async (config: ExamConfig): Promise<{ questio
   }
 
 
-  // Header Layout Template
-  const examHeaderLayout = `| **KHOA ${config.faculty.toUpperCase()}**<br>**BỘ MÔN ${config.department.toUpperCase()}** | **ĐỀ THI KẾT THÚC HỌC PHẦN**<br>Môn: ${config.subject}<br>Đối tượng: ${config.targetAudience}<br>Thời gian: ${config.duration} phút |
-| :--- | :--- |
-`;
-
-  const answerHeaderLayout = `| **KHOA ${config.faculty.toUpperCase()}**<br>**BỘ MÔN ${config.department.toUpperCase()}** | **ĐÁP ÁN ĐỀ THI**<br>Môn: ${config.subject}<br>Đối tượng: ${config.targetAudience} |
-| :--- | :--- |
-`;
-
-  let structurePrompt = "";
-  let variantPrompt = "";
-  const totalVariants = (config.questionType === QuestionType.ESSAY && config.variantCount) ? config.variantCount : 1;
-
-  if (config.questionType === QuestionType.ESSAY && config.levelDistribution) {
-      structurePrompt = `
-      CẤU TRÚC MA TRẬN ĐỀ THI:
-      - Nhận biết: ${config.levelDistribution[DifficultyLevel.RECOGNITION]} câu
-      - Thông hiểu: ${config.levelDistribution[DifficultyLevel.UNDERSTANDING]} câu
-      - Vận dụng: ${config.levelDistribution[DifficultyLevel.APPLICATION]} câu
-      - Vận dụng cao: ${config.levelDistribution[DifficultyLevel.ADVANCED_APPLICATION]} câu
-      `;
-      variantPrompt = `SỐ LƯỢNG MÃ ĐỀ CẦN TẠO: ${totalVariants} ĐỀ KHÁC NHAU (Về nội dung, cùng độ khó).`;
-  } else {
-      structurePrompt = `CẤU TRÚC: ${config.quantity} câu, mức độ ${config.difficulty}.`;
-      variantPrompt = `Tạo duy nhất 01 đề thi.`;
-  }
-
-  const prompt = `
-    Đóng vai trò là giảng viên đại học.
-    Nhiệm vụ: Tạo đề thi và đáp án chi tiết cho môn ${config.subject}.
-    
-    THÔNG SỐ CHUNG:
-    - Chủ đề: ${config.topic || 'Tổng hợp'}
-    - Loại câu hỏi: ${config.questionType}
-    - Yêu cầu đặc biệt: ${config.specificRequirement}
-    
-    ${structurePrompt}
-    ${variantPrompt}
-    
-    YÊU CẦU ĐỊNH DẠNG (FORMATTING REQUIREMENTS):
-    Output JSON gồm 2 trường "questions" và "answers".
-    
-    YÊU CẦU NGẮT TRANG TUYỆT ĐỐI (DÀNH CHO XUẤT WORD):
-    - Sau mỗi mã đề thi (Phần Questions), bắt buộc chèn thẻ: <div class="word-page-break"></div>
-    - Sau mỗi bộ đáp án (Phần Answers), bắt buộc chèn thẻ: <div class="word-page-break"></div>
-
-    1. TRƯỜNG "questions" (Đề bài):
-       - Tạo đủ ${totalVariants} mã đề.
-       - Với MỖI mã đề, lặp lại cấu trúc sau:
-       ${examHeaderLayout}
-       <center><h3>ĐỀ SỐ [X]</h3></center>
-       [Danh sách câu hỏi Đề X]
-       <br>
-       <table style="width: 100%; border: none; margin-top: 30px;">
-       <tr>
-       <td style="width: 50%; border: none; vertical-align: top;">---</td>
-       <td style="width: 50%; text-align: center; border: none; vertical-align: top;"><b>${config.signerTitle}</b><br><br><br><br><br><b>${config.signerName}</b></td>
-       </tr>
-       </table>
-       <div class="word-page-break"></div>
-
-    2. TRƯỜNG "answers" (Đáp án):
-       - Tạo đủ ${totalVariants} phần đáp án cho ${totalVariants} mã đề.
-       - Với MỖI mã đề, lặp lại cấu trúc sau:
-       ${answerHeaderLayout}
-       <center><h3>ĐÁP ÁN ĐỀ SỐ [X]</h3></center>
-       | Nội dung | Điểm |
-       | :--- | :--- |
-       | **Câu 1:** Đáp án... | **2.0đ** |
-       | - Lời giải chi tiết... | 0.5 |
-       <br>
-       <table style="width: 100%; border: none; margin-top: 30px;">
-       <tr>
-       <td style="width: 50%; border: none; vertical-align: top;">---</td>
-       <td style="width: 50%; text-align: center; border: none; vertical-align: top;"><b>${config.signerTitle}</b><br><br><br><br><br><b>${config.signerName}</b></td>
-       </tr>
-       </table>
-       <div class="word-page-break"></div>
-  `;
-  
+  const { examMeta, prompt } = buildExamMetaAndPrompt(config);
   parts.push({ text: prompt });
 
   try {
-    const response = await fetch("/api/generate-exam", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ config, parts })
-    });
+    let attempts = 0;
+    while (attempts < 2) {
+      attempts++;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 55000);
 
-    const rawText = await response.text();
+      try {
+        const response = await fetch("/api/generate-exam", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ parts, examMeta }),
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
 
-    if (!response.ok) {
-        let errorMsg = `Lỗi hệ thống khi gọi AI (${response.status})`;
-        try {
+        const rawText = await response.text();
+        const isHtml = rawText.trim().startsWith("<") || rawText.includes("<!doctype") || rawText.includes("<html");
+
+        if (isHtml && attempts < 2) {
+          console.log("Server returned HTML response during exam generation, retrying in 1.5s...");
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+
+        if (!response.ok) {
+          let errorMsg = `Lỗi hệ thống khi gọi AI (${response.status})`;
+          try {
             const errObj = JSON.parse(rawText);
             errorMsg = errObj.error || errorMsg;
-        } catch {
-            if (rawText.includes("<!doctype") || rawText.includes("<html")) {
+          } catch {
+            if (isHtml) {
               errorMsg = `Server trả về lỗi HTML (${response.status}). Vui lòng thử lại.`;
             } else if (rawText) {
               errorMsg = rawText.slice(0, 200);
             }
-        }
-        throw new Error(errorMsg);
-    }
+          }
 
-    let parsed: any;
-    try {
-        parsed = JSON.parse(rawText);
-    } catch {
-        throw new Error("Phản hồi tạo đề từ AI không đúng định dạng JSON. Vui lòng thử lại.");
+          if (attempts < 2 && (response.status === 500 || response.status === 502 || response.status === 503 || response.status === 504)) {
+            console.log(`Exam generation returned ${response.status}, retrying in 1.5s...`);
+            await new Promise(r => setTimeout(r, 1500));
+            continue;
+          }
+          throw new Error(errorMsg);
+        }
+
+        let parsed: any;
+        try {
+          parsed = JSON.parse(rawText);
+        } catch {
+          if (attempts < 2) {
+            await new Promise(r => setTimeout(r, 1500));
+            continue;
+          }
+          throw new Error("Phản hồi tạo đề từ AI không đúng định dạng JSON. Vui lòng thử lại.");
+        }
+
+        if (!parsed.questions || parsed.questions.length < 50) {
+          throw new Error("AI không tạo được nội dung đề thi. Vui lòng thử lại.");
+        }
+        if (!parsed.answers || parsed.answers.length < 50) {
+          parsed.answers = parsed.answers || "Hệ thống chưa tạo được đáp án chi tiết. Vui lòng thử lại.";
+        }
+        return parsed;
+      } catch (innerErr: any) {
+        clearTimeout(timeoutId);
+        if (attempts < 2 && (innerErr?.name === 'AbortError' || innerErr?.message?.includes('Failed to fetch'))) {
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+        throw innerErr;
+      }
     }
-    if (!parsed.questions || parsed.questions.length < 50) {
-        throw new Error("AI không tạo được nội dung đề thi. Vui lòng thử lại.");
-    }
-    if (!parsed.answers || parsed.answers.length < 50) {
-        parsed.answers = parsed.answers || "Hệ thống chưa tạo được đáp án chi tiết. Vui lòng thử lại.";
-    }
-    return parsed;
+    throw new Error("Không thể tạo đề thi. Vui lòng thử lại.");
   } catch (error: any) {
     console.error("Lỗi khi tạo đề:", error);
     throw error;
@@ -221,43 +180,14 @@ export const gradeSingleSubmission = async (
         parts.push({ text: `[NỘI DUNG ĐÁP ÁN & THANG ĐIỂM NHẬP TRỰC TIẾP]:\n${options.answerKeyText.trim()}\n` });
     }
 
-    const typeDesc = gradingType === 'trac-nghiem' 
-        ? 'Chuyên trách Trắc nghiệm' 
-        : gradingType === 'tu-luan' 
-        ? 'Chuyên trách Tự luận' 
-        : 'Tự động nhận diện toàn diện (Chấm đủ cả Trắc nghiệm và Tự luận nếu đề thi hỗn hợp)';
-
     const fastRule = options?.fastFinalResultGrading !== false;
-
-    const prompt = `
-      Nhiệm vụ: Giám khảo Chấm thi Đại học công tâm, chính xác tuyệt đối từng câu.
-      Chế độ chấm: ${typeDesc}.
-      Tệp bài làm nộp lên: "${submissionFile.name}".
-      ${options?.examQuestionFile ? `Đề bài gốc: "${options.examQuestionFile.name}". Bắt buộc đối chiếu theo từng yêu cầu của đề bài này.` : ''}
-      ${answerKeyFile ? `Tệp đáp án chuẩn: "${answerKeyFile.name}" (nếu có nhiều mã đề, bắt buộc tìm đúng mã đề của thí sinh để đối chiếu).` : 'LƯU Ý: Không có tệp đáp án riêng. Giám khảo AI tự giải chính xác từng câu của đề thi làm đáp án chuẩn, sau đó tiến hành đối chiếu và chấm điểm.'}
-
-      ${fastRule ? `
-      ⭐ QUY TẮC CHẤM ĐẶC BIỆT: "NẾU BÀI LÀM ĐÚNG ĐÁP ÁN CUỐI CÙNG CHO ĐIỂM CUỐI CÙNG, CÒN KHÔNG ĐÚNG ĐÁP ÁN CUỐI CÙNG MỚI CHẤM ĐIỂM CÁC THÀNH PHẦN":
-      - Với từng câu / ý tự luận:
-        + BƯỚC 1: Tìm kết quả / đáp số cuối cùng của thí sinh (kể cả kèm đơn vị đo). Nếu kết quả cuối cùng ĐÚNG -> Cho ngay ĐIỂM TỐI ĐA (điểm cuối cùng trọn vẹn) của câu/ý đó (ghi nhận: "✅ Đáp số cuối cùng chính xác -> Đạt trọn điểm").
-        + BƯỚC 2: Chỉ khi kết quả cuối cùng SAI, tính nhầm, hoặc chưa xong: MỚI BẮT ĐẦU rà soát từng thành phần (công thức gốc, biến đổi trung gian, thay số) để cho điểm thành phần các bước đúng theo bareme.
-      ` : ''}
-
-      YÊU CẦU BẮT BUỘC ĐỂ CHẤM CHUẨN XÁC:
-      1. TÌM TÊN THÍ SINH & TÁCH BÀI:
-         - Quét tìm Họ và tên thật, MSSV/SBD, Lớp, Mã đề thi.
-         - NẾU TÀI LIỆU CÓ BÀI THI CỦA 2 HAY NHIỀU THÍ SINH: Bắt buộc tách thành từng phần tử riêng biệt trong mảng "students" (mỗi em một phần tử).
-      2. ĐỐI CHIẾU TỪNG CÂU VÀ TÍNH ĐIỂM CHUẨN XÁC:
-         - Đọc kỹ bài làm: Thí sinh có thể khoanh trực tiếp, viết bảng đáp án hoặc viết lời giải.
-         - Trắc nghiệm: Lập bảng đối chiếu từng câu (| Câu | Đáp án thí sinh | Đáp án chuẩn | Đánh giá | Điểm đạt |).
-         - Tự luận: Lập bảng điểm chi tiết từng câu:
-           | Câu / Ý | Yêu cầu đề bài | Kết quả cuối của HS | Đánh giá KQ cuối | Phương thức chấm | Thang điểm | Điểm đạt | Nhận xét chi tiết (Thành phần nếu sai) |
-         - Đề hỗn hợp: Bắt buộc chấm cả trắc nghiệm và tự luận.
-      3. KHÔNG SAI LỆCH SỐ HỌC:
-         - Tổng điểm ở "score" và "TỔNG ĐIỂM CHÍNH THỨC" trong feedback BẮT BUỘC bằng đúng tổng cộng điểm đạt của từng câu trong Bảng điểm chi tiết!
-      4. PHIẾU CHẤM ĐIỂM CHUẨN ĐẠI HỌC TRONG "feedback":
-         Trình bày đầy đủ: Tiêu đề phiếu, Thông tin thí sinh, Bảng điểm chi tiết, Tổng điểm (số + chữ), Xếp loại, Nhận xét ưu/nhược điểm và Bảng chữ ký 2 giám khảo.
-    `;
+    const prompt = buildGradingUserPrompt({
+      submissionFileName: submissionFile.name,
+      examQuestionFileName: options?.examQuestionFile?.name,
+      answerKeyFileName: answerKeyFile?.name,
+      gradingType,
+      fastFinalResultGrading: fastRule,
+    });
 
     parts.push({ text: prompt });
 

@@ -1,6 +1,12 @@
 import express from "express";
 import path from "path";
 import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
+import {
+    formatExamFromVariants,
+    getExamSystemInstruction,
+    GRADING_SYSTEM_INSTRUCTION,
+    synchronizeStudentScores
+} from "./utils/examHelpers";
 
 async function startServer() {
     const app = express();
@@ -219,60 +225,113 @@ async function startServer() {
     // API routes
     app.post("/api/generate-exam", async (req, res) => {
         try {
-            const { parts } = req.body;
+            const { parts, examMeta } = req.body || {};
+            if (!Array.isArray(parts) || parts.length === 0) {
+                return res.status(400).json({ error: "Thiếu dữ liệu yêu cầu tạo đề thi." });
+            }
             const ai = getAI();
             const sanitizedParts = await sanitizePartsForGemini(parts);
-            
-            let responseText = "";
-            try {
-                const response = await ai.models.generateContent({ 
-                    model: "gemini-3.8-flash",
-                    contents: [{ role: "user", parts: sanitizedParts }],
-                    config: {
-                        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-                        responseMimeType: "application/json",
-                        responseSchema: {
-                            type: Type.OBJECT,
-                            properties: {
-                                questions: { type: Type.STRING },
-                                answers: { type: Type.STRING }
-                            },
-                            required: ["questions", "answers"]
-                        }
+
+            const parseExamJson = (raw: string) => {
+                const cleaned = raw.replace(/```json\n?|\n?```/g, '').trim();
+                try {
+                    return JSON.parse(cleaned);
+                } catch {
+                    const start = cleaned.indexOf('{');
+                    const end = cleaned.lastIndexOf('}');
+                    if (start !== -1 && end > start) {
+                        return JSON.parse(cleaned.slice(start, end + 1));
                     }
-                });
-                responseText = response.text || "";
-            } catch (err: any) {
-                const isTimeout = err.status === 504 || err.message?.includes("504") || err.message?.includes("DEADLINE_EXCEEDED");
-                if (isTimeout) {
-                    console.log("gemini-3.8-flash timed out for exam generation. Retrying with gemini-3.1-flash-lite...");
-                    const fallback = await ai.models.generateContent({ 
-                        model: "gemini-3.1-flash-lite",
-                        contents: [{ role: "user", parts: sanitizedParts }],
-                        config: {
-                            responseMimeType: "application/json",
-                            responseSchema: {
+                    throw new Error("Phản hồi tạo đề từ AI không đúng định dạng JSON.");
+                }
+            };
+
+            const useStructuredVariants = Boolean(examMeta && typeof examMeta === 'object');
+            const examSystemInstruction = getExamSystemInstruction(examMeta);
+
+            const responseSchema = useStructuredVariants
+                ? {
+                    type: Type.OBJECT,
+                    properties: {
+                        variants: {
+                            type: Type.ARRAY,
+                            description: "Danh sách các mã đề thi và đáp án tương ứng",
+                            items: {
                                 type: Type.OBJECT,
                                 properties: {
-                                    questions: { type: Type.STRING },
-                                    answers: { type: Type.STRING }
+                                    variantNumber: { type: Type.INTEGER, description: "Số thứ tự mã đề (1, 2, 3...)" },
+                                    questions: {
+                                        type: Type.ARRAY,
+                                        items: {
+                                            type: Type.OBJECT,
+                                            properties: {
+                                                sectionTitle: { type: Type.STRING, description: "Tiêu đề phần nếu là đề nhiều phần (vd: PHẦN I. TRẮC NGHIỆM 4 PHƯƠNG ÁN), để trống nếu không chia phần" },
+                                                questionLabel: { type: Type.STRING, description: "Ví dụ: Câu 1 (Nhận biết - 0.5 điểm):" },
+                                                questionContent: { type: Type.STRING, description: "Nội dung câu hỏi (có đủ A., B., C., D. nếu 4 đáp án; ý a), b), c), d) nếu tự luận hoặc đúng/sai; ...... nếu điền khuyết)" }
+                                            },
+                                            required: ["questionLabel", "questionContent"]
+                                        }
+                                    },
+                                    answerRows: {
+                                        type: Type.ARRAY,
+                                        items: {
+                                            type: Type.OBJECT,
+                                            properties: {
+                                                content: { type: Type.STRING, description: "Tiêu đề câu/phần hoặc nội dung 1 dòng đáp án/bước giải cụ thể" },
+                                                points: { type: Type.STRING, description: "Để '' cho dòng tiêu đề; chỉ ghi '0.25' hoặc '0.5' cho từng dòng chấm điểm (tuyệt đối không ghi >= 0.75)" }
+                                            },
+                                            required: ["content", "points"]
+                                        }
+                                    }
                                 },
-                                required: ["questions", "answers"]
+                                required: ["variantNumber", "questions", "answerRows"]
                             }
                         }
+                    },
+                    required: ["variants"]
+                }
+                : {
+                    type: Type.OBJECT,
+                    properties: {
+                        questions: { type: Type.STRING },
+                        answers: { type: Type.STRING }
+                    },
+                    required: ["questions", "answers"]
+                };
+
+            let parsedResult: any = null;
+            const candidateModels = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-flash-latest"];
+            let lastModelError: any = null;
+            for (const modelName of candidateModels) {
+                try {
+                    const response = await ai.models.generateContent({
+                        model: modelName,
+                        contents: [{ role: "user", parts: sanitizedParts }],
+                        config: {
+                            temperature: 0.1,
+                            systemInstruction: examSystemInstruction,
+                            responseMimeType: "application/json",
+                            responseSchema
+                        }
                     });
-                    responseText = fallback.text || "";
-                } else {
-                    throw err;
+                    const responseText = response.text || "";
+                    if (!responseText) throw new Error(`Empty response from ${modelName}`);
+                    parsedResult = parseExamJson(responseText);
+                    break;
+                } catch (err: any) {
+                    lastModelError = err;
+                    console.warn(`Model ${modelName} failed for exam generation:`, err.message);
                 }
             }
-
-            if (!responseText) {
-                throw new Error("AI không phản hồi nội dung đề thi.");
+            if (!parsedResult) {
+                throw lastModelError || new Error("AI không phản hồi nội dung đề thi.");
             }
 
-            const cleanText = responseText.replace(/```json\n?|\n?```/g, '').trim();
-            res.json(JSON.parse(cleanText));
+            if (useStructuredVariants && Array.isArray(parsedResult?.variants) && parsedResult.variants.length > 0) {
+                return res.json(formatExamFromVariants(parsedResult.variants, examMeta));
+            }
+
+            res.json(parsedResult);
         } catch (error: any) {
             console.error("Error generating exam:", error);
             let message = error.message || "Lỗi không xác định";
@@ -333,62 +392,7 @@ async function startServer() {
             const ai = getAI();
             const sanitizedParts = await sanitizePartsForGemini(parts);
 
-            const gradingSystemInstruction = `
-Bạn là Trưởng Ban Chấm thi Đại học / Hội đồng Chấm thi Quốc gia công tâm, nghiêm ngặt, chuẩn mực và ổn định tuyệt đối (DETERMINISTIC).
-Mục tiêu tối thượng: Kết quả chấm phải CHUẨN XÁC, CÔNG BẰNG, KHÔNG THAY ĐỔI GIỮA CÁC LẦN CHẤM, và TUYỆT ĐỐI KHÔNG ĐỂ XẢY RA HIỆN TƯỢNG BÀI TỆ LẠI CÓ ĐIỂM CAO HƠN BÀI TỐT.
-
-QUY TẮC BẮT BUỘC ĐỂ ĐẢM BẢO TÍNH ỔN ĐỊNH VÀ CÔNG BẰNG 100%:
-
-1. CỐ ĐỊNH BẢNG BAREM THANG ĐIỂM (RUBRIC ANCHORING):
-   - Đọc kỹ ĐỀ BÀI và ĐÁP ÁN CHUẨN để trích xuất cố định danh sách tất cả các câu hỏi (ví dụ Câu 1a, 1b, 1c, 1d; Câu 2a, 2b, 2c, 2d...) và thang điểm tối đa của từng câu (Tổng điểm tối đa toàn bài bắt buộc đúng bằng 10.0 điểm).
-   - TẤT CẢ CÁC BÀI THI trong cùng đợt chấm đều BẮT BUỘC PHẢI DÙNG CHUNG ĐÚNG 1 BẢNG BAREM NÀY. Thang điểm của từng câu không được thay đổi bất thường giữa các thí sinh hay giữa các lần chấm.
-
-2. CÔNG BẰNG TUYỆT ĐỐI & CHỐNG ĐẢO NGƯỢC THỨ HẠNG (ANTI-INVERSION):
-   - Thí sinh làm nhiều câu hơn, giải đúng nhiều bước hơn BẮT BUỘC PHẢI CÓ ĐIỂM CAO HƠN thí sinh bỏ câu, làm ít hoặc làm sai.
-   - BỎ TRỐNG / KHÔNG LÀM: Bất kỳ câu nào thí sinh không giải hoặc bỏ trống trong bài làm (ví dụ: không làm câu 2c, 2d), BẮT BUỘC CHO 0.0 ĐIỂM cho câu đó trong Bảng điểm chi tiết.
-   - CHỐNG ĐOÁN MÒ / GHI BỪA SỐ: Để được công nhận "Đúng kết quả cuối cùng", thí sinh BẮT BUỘC PHẢI CÓ CÁC BƯỚC BIẾN ĐỔI / CÔNG THỨC / LỜI GIẢI HỢP LÝ trong bài thi dẫn đến kết quả đó.
-     * Nếu thí sinh chỉ ghi trơ trọi một con số kết quả mà hoàn toàn không có lời giải/bước tính: KHÔNG ĐƯỢC CHO TRỌN ĐIỂM (tối đa chỉ 0.25đ phần đáp số nếu đúng số).
-     * Tuyệt đối không cho điểm nếu thí sinh ghi bừa kết quả mà không làm bài.
-   - CHẤM THÀNH PHẦN CÔNG BẰNG CHO THÍ SINH GIẢI ĐÚNG BẢN CHẤT:
-     * Thí sinh viết đúng công thức gốc, biến đổi đúng phương pháp nhưng chỉ tính nhầm số học ở bước cuối: BẮT BUỘC cho điểm các bước làm đúng (chiếm 60% - 80% số điểm của câu), chỉ trừ phần điểm đáp số cuối (20% - 40%). Tuyệt đối không được trừ sạch điểm của thí sinh giải đúng phương pháp.
-
-3. QUY TRÌNH CHẤM THEO KẾT QUẢ CUỐI CÙNG & THÀNH PHẦN:
-   - Với MỖI câu hỏi / ý:
-     + BƯỚC 1: Kiểm tra xem thí sinh có giải câu này không. Nếu BỎ TRỐNG -> Cho 0.0đ.
-     + BƯỚC 2: Kiểm tra Lời giải & Kết quả cuối cùng:
-       * NẾU CÓ LỜI GIẢI HỢP LÝ VÀ ĐÁP ÁN CUỐI CÙNG ĐÚNG (kể cả kèm đơn vị đo theo đề bài): Cho ngay ĐIỂM TỐI ĐA TRỌN VẸN của câu đó (Cách chấm áp dụng: "Trọn điểm (Đúng KQ cuối)").
-       * NẾU KẾT QUẢ CUỐI CÙNG SAI / THIẾU / TÍNH NHẦM: Rà soát từng thành phần theo barem điểm từng bước (Công thức gốc -> Biến đổi -> Thay số). Cho điểm thành phần ở các bước thí sinh làm đúng, chỉ trừ điểm ở bước tính sai (Cách chấm áp dụng: "Chấm thành phần (Sai KQ cuối)").
-
-4. PHIẾU CHẤM ĐIỂM CHUẨN ĐẠI HỌC (KHUÔN MẪU PHIÊN BẢN CŨ):
-Mọi bài thi đều phải xuất ra phiếu chấm trong trường "feedback" theo đúng chuẩn mẫu cũ sau:
-
-# PHIẾU CHẤM ĐIỂM THI KẾT THÚC HỌC PHẦN
-
-- **Họ và tên thí sinh:** [Họ tên thật của thí sinh trích xuất từ bài thi]
-- **Mã số sinh viên (MSSV / SBD):** [MSSV hoặc Không có]
-- **Lớp / Khóa:** [Lớp hoặc Không có]
-- **Mã đề thi:** [Mã đề hoặc Không có]
-
-### BẢNG ĐIỂM CHI TIẾT TỪNG CÂU
-| Câu / Ý | Yêu cầu đề bài | Kết quả cuối của HS | Đánh giá KQ cuối | Phương thức chấm | Thang điểm | Điểm đạt | Nhận xét chi tiết (Thành phần nếu sai) |
-| :---: | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
-[Liệt kê đầy đủ mọi câu từ Câu 1 đến câu cuối cùng theo đúng barem đề thi, không được bỏ sót câu nào]
-
-### TỔNG KẾT ĐÁNH GIÁ & XẾP LOẠI
-- **TỔNG ĐIỂM CHÍNH THỨC:** **[X.X] / 10** (*Bằng chữ: [Ghi điểm bằng chữ]*)
-- **Thang điểm 4:** **[Y.Y / 4.0]** | **Điểm chữ:** **[A/B/C/D/F]**
-- **Xếp loại:** **[Xuất sắc / Giỏi / Khá / Trung bình / Chưa đạt]**
-- **Nhận xét chung:**
-  - **Ưu điểm:** [Nêu ưu điểm của bài làm]
-  - **Hạn chế / Lưu ý:** [Nêu các điểm sai sót hoặc câu chưa làm]
-
-| CÁN BỘ CHẤM THI 1 | CÁN BỘ CHẤM THI 2 |
-| :---: | :---: |
-| *(Ký và ghi rõ họ tên)* | *(Ký và ghi rõ họ tên)* |
-
-5. CỘNG ĐIỂM CHÍNH XÁC TUYỆT ĐỐI (ARITHMETIC INTEGRITY):
-   - "totalScoreNum" và "score" BẮT BUỘC PHẢI BẰNG ĐÚNG tổng cộng điểm đạt của từng câu trong Bảng điểm chi tiết (ví dụ: các câu trong bảng cộng lại ra 6.5 thì totalScoreNum phải là 6.5 và score là "6.5/10", tuyệt đối không được ghi sai lệch).
-`;
+            const gradingSystemInstruction = GRADING_SYSTEM_INSTRUCTION;
 
             const gradingSchema = {
                 type: Type.OBJECT,
@@ -470,131 +474,8 @@ Mọi bài thi đều phải xuất ra phiếu chấm trong trường "feedback"
                     }
                 ];
 
-    function numberToVietnameseScore(num: number): string {
-        const digitWords = ["Không", "Một", "Hai", "Ba", "Bốn", "Năm", "Sáu", "Bảy", "Tám", "Chín", "Mười"];
-        const rounded = Math.round(num * 100) / 100;
-        const intPart = Math.floor(rounded);
-        const decPart = Math.round((rounded - intPart) * 100);
-        let res = digitWords[intPart] || intPart.toString();
-        if (decPart > 0) {
-            if (decPart % 10 === 0) {
-                const d = decPart / 10;
-                res += " phẩy " + (d === 5 ? "năm" : (digitWords[d] ? digitWords[d].toLowerCase() : d));
-            } else if (decPart < 10) {
-                res += " phẩy không " + (digitWords[decPart] ? digitWords[decPart].toLowerCase() : decPart);
-            } else {
-                const d1 = Math.floor(decPart / 10);
-                const d2 = decPart % 10;
-                const w1 = d1 === 7 ? "bảy" : (digitWords[d1] ? digitWords[d1].toLowerCase() : d1);
-                const w2 = d2 === 5 ? "lăm" : (digitWords[d2] ? digitWords[d2].toLowerCase() : d2);
-                res += " phẩy " + w1 + " " + w2;
-            }
-        }
-        return res;
-    }
-
-    function extractExactScoreFromFeedback(md: string): number | null {
-        if (!md || typeof md !== 'string') return null;
-
-        // 1. Try extracting from Table "Điểm đạt"
-        const lines = md.split(/\r?\n/);
-        let headerCol = -1;
-        const scores: number[] = [];
-
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) continue;
-            if (/^\|\s*[: -]+\s*\|/.test(trimmed)) continue;
-
-            const cells = trimmed.split("|").slice(1, -1).map(c => c.trim());
-
-            if (headerCol === -1) {
-                for (let i = 0; i < cells.length; i++) {
-                    const c = cells[i].toLowerCase();
-                    if (c.includes("điểm đạt") || c.includes("điểm số") || (c.includes("điểm") && !c.includes("thang"))) {
-                        headerCol = i;
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            const rowText = trimmed.toLowerCase();
-            if (rowText.includes("tổng cộng") || rowText.includes("tổng điểm")) continue;
-
-            if (cells.length > headerCol) {
-                const clean = cells[headerCol].replace(/[^\d.,]/g, "").replace(",", ".");
-                const val = parseFloat(clean);
-                if (!isNaN(val)) {
-                    scores.push(val);
-                }
-            }
-        }
-
-        if (scores.length > 0) {
-            const total = scores.reduce((a, b) => a + b, 0);
-            return Math.max(0, Math.min(10, Math.round(total * 100) / 100));
-        }
-
-        // 2. Fallback: Try extracting from addition expression before "="
-        const match = md.match(/-\s*\*\*Chi tiết cộng điểm:\*\*\s*(.*?)(?=\n|$)/i);
-        if (match) {
-            const lhs = match[1].split("=")[0];
-            const nums = (lhs.match(/\d+(?:[.,]\d+)?/g) || []).map(n => parseFloat(n.replace(",", ".")));
-            if (nums.length > 0) {
-                const total = nums.reduce((a, b) => a + b, 0);
-                return Math.max(0, Math.min(10, Math.round(total * 100) / 100));
-            }
-        }
-
-        return null;
-    }
-
             // Programmatically calculate exact score sum from individual questions in table
-            for (const st of students) {
-                const exactScore = extractExactScoreFromFeedback(st.feedback);
-                if (exactScore !== null) {
-                    st.totalScoreNum = exactScore;
-                    st.score = `${exactScore}/10`;
-                    st.scoreText = numberToVietnameseScore(exactScore);
-
-                    // Synchronize feedback markdown
-                    let fb = st.feedback;
-                    fb = fb.replace(/(-\s*\*\*Chi tiết cộng điểm:\*\*.*?=)\s*[\d.,]+\s*đ?/i, `$1 ${exactScore}đ`);
-                    fb = fb.replace(/(-\s*\*\*(?:TỔNG ĐIỂM CHÍNH THỨC|Tổng điểm chính thức|Tổng điểm):\*\*\s*\*\*?).*?(\/\s*10\*\*?)/i, `$1${exactScore} $2`);
-                    fb = fb.replace(/(\*Bằng chữ:\s*)[^*]+(\*)/i, `$1${st.scoreText}$2`);
-
-                    let gpa4 = 0.0;
-                    let gradeLetter = 'F';
-                    let rank = 'Chưa đạt';
-
-                    if (exactScore >= 8.5) {
-                        gpa4 = 4.0; gradeLetter = 'A'; rank = 'Xuất sắc';
-                    } else if (exactScore >= 8.0) {
-                        gpa4 = 3.5; gradeLetter = 'B+'; rank = 'Giỏi';
-                    } else if (exactScore >= 7.0) {
-                        gpa4 = 3.0; gradeLetter = 'B'; rank = 'Khá';
-                    } else if (exactScore >= 6.5) {
-                        gpa4 = 2.5; gradeLetter = 'C+'; rank = 'Trung bình khá';
-                    } else if (exactScore >= 5.5) {
-                        gpa4 = 2.0; gradeLetter = 'C'; rank = 'Trung bình';
-                    } else if (exactScore >= 5.0) {
-                        gpa4 = 1.5; gradeLetter = 'D+'; rank = 'Trung bình yếu';
-                    } else if (exactScore >= 4.0) {
-                        gpa4 = 1.0; gradeLetter = 'D'; rank = 'Đạt (yếu)';
-                    } else {
-                        gpa4 = 0.0; gradeLetter = 'F'; rank = 'Chưa đạt (Kém)';
-                    }
-
-                    fb = fb.replace(/(-\s*\*\*Thang điểm 4:\*\*\s*\*\*).*?(?=\n|$)/i, `- **Thang điểm 4:** **${gpa4.toFixed(1)} / 4.0** | **Điểm chữ:** **${gradeLetter}**`);
-                    fb = fb.replace(/(-\s*\*\*(?:Xếp loại|Xếp loại học lực):\*\*\s*\*\*).*?(?=\n|$)/i, `- **Xếp loại:** **${rank}**`);
-
-                    st.feedback = fb;
-                } else if (typeof st.totalScoreNum === 'number') {
-                    const rounded = Math.round(st.totalScoreNum * 100) / 100;
-                    st.score = `${rounded}/10`;
-                }
-            }
+            synchronizeStudentScores(students);
 
             return res.json({
                 students,
@@ -615,6 +496,13 @@ Mọi bài thi đều phải xuất ra phiếu chấm trong trường "feedback"
     });
 
 
+
+    // Ensure /api/* errors always return JSON instead of Express default HTML 500 page
+    app.use('/api', (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+        console.error("Express API middleware error:", err);
+        const status = err.status || err.statusCode || 500;
+        res.status(status).json({ error: err.message || "Lỗi máy chủ API" });
+    });
 
     // Vite middleware for development
     if (process.env.NODE_ENV !== "production") {

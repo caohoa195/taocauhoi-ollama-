@@ -5,6 +5,7 @@ import { generateExamContent, gradeSingleSubmission, fileToGenerativePart } from
 import { generateExamContentOllama, gradeSingleSubmissionOllama } from './services/ollamaService';
 import { ExamConfig, GeneratedContent, GradingConfig, GradingResult, StudentGradingResult, AIProvider, OllamaConfig } from './types';
 import { BookOpen, FileCheck, AlertCircle, FileText, FileType, Cpu, Server, Sparkles, Users, Award, CheckCircle2, Clock, XCircle, Search, Download, RotateCw, AlertTriangle, X } from 'lucide-react';
+import { generateWordDocxBlob, normalizeExamMarkdown } from './utils/wordExporter';
 
 interface DownloadActionsProps {
   content: string;
@@ -15,15 +16,17 @@ interface DownloadActionsProps {
 const DownloadActions: React.FC<DownloadActionsProps> = ({ content, prefix, onDownload }) => (
   <div className="flex gap-2">
     <button 
-      onClick={() => onDownload(content, `${prefix}.doc`, 'doc')}
-      className="flex items-center gap-1 text-xs bg-blue-100 hover:bg-blue-200 text-blue-800 px-2 py-1 rounded transition-colors"
-      title="Tải về file Word"
+      type="button"
+      onClick={() => onDownload(content, `${prefix}.docx`, 'doc')}
+      className="flex items-center gap-1 text-xs bg-blue-100 hover:bg-blue-200 text-blue-800 px-2 py-1 rounded transition-colors cursor-pointer"
+      title="Tải về file Word (.docx)"
     >
       <FileType size={14} /> Word
     </button>
     <button 
+      type="button"
       onClick={() => onDownload(content, `${prefix}.txt`, 'txt')}
-      className="flex items-center gap-1 text-xs bg-gray-100 hover:bg-gray-200 text-gray-800 px-2 py-1 rounded transition-colors"
+      className="flex items-center gap-1 text-xs bg-gray-100 hover:bg-gray-200 text-gray-800 px-2 py-1 rounded transition-colors cursor-pointer"
       title="Tải về file Text"
     >
       <FileText size={14} /> .txt
@@ -59,7 +62,7 @@ const App: React.FC = () => {
   const [ollamaConfig, setOllamaConfig] = useState<OllamaConfig>(() => {
     return {
       baseUrl: localStorage.getItem('uniexam_ollama_url') || 'http://localhost:11434',
-      model: localStorage.getItem('uniexam_ollama_model') || 'qwen2.5-coder:7b',
+      model: localStorage.getItem('uniexam_ollama_model') || 'gemma4:e4b',
       connectionMode: (localStorage.getItem('uniexam_ollama_mode') as 'browser' | 'proxy') || 'browser',
     };
   });
@@ -87,14 +90,25 @@ const App: React.FC = () => {
         try {
           result = await generateExamContentOllama(config, ollamaConfig);
         } catch (ollamaErr: any) {
-          console.warn("Ollama tạo đề không kết nối được, tự động chuyển sang Gemini Cloud:", ollamaErr.message);
-          result = await generateExamContent(config);
-          setOllamaFallbackNotice("Ollama cục bộ tại localhost:11434 không phản hồi. Hệ thống đã tự động chuyển sang Gemini Cloud AI để hoàn tất tạo đề.");
+          console.warn("Ollama tạo đề gặp lỗi, thử chuyển sang Gemini Cloud:", ollamaErr.message);
+          try {
+            result = await generateExamContent(config);
+            setOllamaFallbackNotice(
+              ollamaErr?.message?.includes('không hỗ trợ đọc ảnh')
+                ? `${ollamaErr.message} Hệ thống đã tạm dùng Gemini Cloud để hoàn tất.`
+                : `Ollama cục bộ tại ${ollamaConfig.baseUrl} không phản hồi. Hệ thống đã tự động chuyển sang Gemini Cloud AI để hoàn tất tạo đề.`
+            );
+          } catch {
+            throw ollamaErr;
+          }
         }
       } else {
         result = await generateExamContent(config);
       }
-      setGeneratedContent(result);
+      setGeneratedContent({
+        questions: normalizeExamMarkdown(result.questions),
+        answers: normalizeExamMarkdown(result.answers),
+      });
     } catch (err: any) {
       console.error("Lỗi khi tạo đề:", err);
       setError(err.message || "Đã xảy ra lỗi khi tạo đề.");
@@ -180,8 +194,16 @@ const App: React.FC = () => {
         } catch (ollamaErr: any) {
           if (!forceProvider) {
             console.warn("Ollama không phản hồi, tự động thử với Gemini Cloud:", ollamaErr.message);
-            res = await gradeSingleSubmission(file, lastGradingConfig.answerKeyFile, lastGradingConfig.gradingType, target.studentName, retryOptions);
-            setOllamaFallbackNotice("Ollama cục bộ không phản hồi. Đã hoàn tất chấm điểm bằng Gemini Cloud AI.");
+            try {
+              res = await gradeSingleSubmission(file, lastGradingConfig.answerKeyFile, lastGradingConfig.gradingType, target.studentName, retryOptions);
+              setOllamaFallbackNotice(
+                ollamaErr?.message?.includes('không hỗ trợ đọc ảnh')
+                  ? `${ollamaErr.message} Hệ thống đã tạm dùng Gemini Cloud để hoàn tất.`
+                  : "Ollama cục bộ không phản hồi. Đã hoàn tất chấm điểm bằng Gemini Cloud AI."
+              );
+            } catch {
+              throw ollamaErr;
+            }
           } else {
             throw ollamaErr;
           }
@@ -286,9 +308,17 @@ const App: React.FC = () => {
           try {
             res = await gradeSingleSubmissionOllama(file, config.answerKeyFile, config.gradingType, ollamaConfig, file.name, currentGradingOptions);
           } catch (ollamaErr: any) {
-            console.warn(`Ollama không khả dụng cho file ${file.name}, tự động chuyển sang Gemini Cloud AI:`, ollamaErr.message);
-            res = await gradeSingleSubmission(file, config.answerKeyFile, config.gradingType, file.name, currentGradingOptions);
-            setOllamaFallbackNotice("Ollama cục bộ tại localhost:11434 không phản hồi (chưa khởi chạy hoặc chặn kết nối). Hệ thống đã tự động chuyển sang Gemini Cloud AI để hoàn tất chấm bài mà không bị gián đoạn.");
+            console.warn(`Ollama gặp lỗi cho file ${file.name}, tự động thử Gemini Cloud AI:`, ollamaErr.message);
+            try {
+              res = await gradeSingleSubmission(file, config.answerKeyFile, config.gradingType, file.name, currentGradingOptions);
+              setOllamaFallbackNotice(
+                ollamaErr?.message?.includes('không hỗ trợ đọc ảnh')
+                  ? `${ollamaErr.message} Hệ thống đã tạm dùng Gemini Cloud AI để hoàn tất.`
+                  : "Ollama cục bộ tại localhost:11434 không phản hồi (chưa khởi chạy hoặc chặn kết nối). Hệ thống đã tự động chuyển sang Gemini Cloud AI để hoàn tất chấm bài mà không bị gián đoạn."
+              );
+            } catch {
+              throw ollamaErr;
+            }
           }
         } else {
           res = await gradeSingleSubmission(file, config.answerKeyFile, config.gradingType, file.name, currentGradingOptions);
@@ -552,34 +582,47 @@ const App: React.FC = () => {
     `;
   };
 
-  const downloadFile = (content: string, filename: string, type: 'txt' | 'doc') => {
-    console.log(`Downloading ${filename}, type: ${type}, content length: ${content?.length}`);
-    
-    if (!content) {
+  const downloadFile = async (content: string, filename: string, type: 'txt' | 'doc') => {
+    const cleanContent = typeof content === 'string' ? content.trim() : '';
+    if (!cleanContent) {
         console.warn("Attempted to download empty content");
         setError("Nội dung trống, không thể tải về.");
         return;
     }
 
-    let blob: Blob;
-    if (type === 'doc') {
-        const finalContent = markdownToHtml(content);
-        console.log("Word content parsed length:", finalContent.length);
-        blob = new Blob([finalContent], { type: 'application/msword;charset=utf-8' });
-    } else {
-        blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-    }
+    try {
+      let blob: Blob;
+      let targetFilename = filename;
 
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => {
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-    }, 100);
+      if (type === 'doc') {
+          targetFilename = filename.endsWith('.doc') ? `${filename}x` : filename;
+          blob = await generateWordDocxBlob(cleanContent);
+          if (!blob || blob.size === 0) {
+              const fallbackHtml = markdownToHtml(cleanContent);
+              blob = new Blob(['\ufeff', fallbackHtml], { type: 'application/msword;charset=utf-8' });
+              targetFilename = filename.replace(/\.docx$/i, '.doc');
+          }
+      } else {
+          blob = new Blob(['\ufeff', cleanContent], { type: 'text/plain;charset=utf-8' });
+      }
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = targetFilename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+          if (a.parentNode) {
+              a.parentNode.removeChild(a);
+          }
+          URL.revokeObjectURL(url);
+      }, 15000);
+    } catch (dlErr: any) {
+      console.error("Download error:", dlErr);
+      setError(`Không thể tạo tệp tải về: ${dlErr?.message || 'Lỗi không xác định'}`);
+    }
   };
 
   return (
@@ -790,8 +833,12 @@ const App: React.FC = () => {
                           const a = document.createElement('a');
                           a.href = url;
                           a.download = `bang_diem_tong_hop_${new Date().toISOString().slice(0, 10)}.csv`;
+                          document.body.appendChild(a);
                           a.click();
-                          URL.revokeObjectURL(url);
+                          setTimeout(() => {
+                            if (a.parentNode) a.parentNode.removeChild(a);
+                            URL.revokeObjectURL(url);
+                          }, 15000);
                         }}
                         className="flex items-center gap-1.5 text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-300 font-semibold px-3 py-2 rounded-lg transition-colors cursor-pointer"
                         title="Tải bảng điểm tổng hợp CSV"
@@ -814,12 +861,12 @@ ${s.feedback || 'Chưa có nội dung phiếu chấm'}
 
 <div class="word-page-break"></div>
                           `).join("\n\n---\n\n");
-                          downloadFile(allFeedback, `tong_hop_phieu_cham_thi_tat_ca_thi_sinh.doc`, 'doc');
+                          downloadFile(allFeedback, `tong_hop_phieu_cham_thi_tat_ca_thi_sinh.docx`, 'doc');
                         }}
                         className="flex items-center gap-1.5 text-xs bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-300 font-semibold px-3 py-2 rounded-lg transition-colors cursor-pointer"
                         title="Tải toàn bộ phiếu chấm thi Word của tất cả thí sinh"
                       >
-                        <FileType size={14} /> Xuất tất cả bài làm (.doc)
+                        <FileType size={14} /> Xuất tất cả bài làm (.docx)
                       </button>
                     </div>
                   </div>
