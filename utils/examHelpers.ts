@@ -604,13 +604,13 @@ const normalizeQuestionKey = (q: string): string => {
     // Preserve sub-part letters like (a), (b), (c), (d) while stripping point/difficulty annotations
     .replace(/\(\s*([a-d])\s*\)/gi, ' $1 ')
     .replace(/\([^)]*\)/g, ' ')
-    .replace(/[.:：\-]/g, ' ')
+    .replace(/[.:：\-/]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
 };
 
-const compactQuestionKey = (q: string): string => {
+export const compactQuestionKey = (q: string): string => {
   return normalizeQuestionKey(q)
     .replace(/^(?:câu|bài|ý|phần)\s*/i, '')
     .replace(/\s+/g, '');
@@ -725,29 +725,54 @@ export function extractDeterministicRubricFromText(rawText?: string): string {
 
 export function enforceMasterRubricOnRows(
   rawRows: StructuredQuestionGradeRow[],
-  masterRubric?: string
+  masterRubric?: string,
+  lockedUnattemptedQuestions?: string[]
 ): StructuredQuestionGradeRow[] {
+  const unattemptedSet = new Set(
+    (Array.isArray(lockedUnattemptedQuestions) ? lockedUnattemptedQuestions : [])
+      .map((q) => compactQuestionKey(q))
+      .filter(Boolean)
+  );
+
   const sanitized: StructuredQuestionGradeRow[] = (Array.isArray(rawRows) ? rawRows : []).map((r, idx) => {
     const question = sanitizeTableCell(r?.question, `Câu ${idx + 1}`);
+    const qCompact = compactQuestionKey(question);
     const maxScore = roundScore2(Math.max(0, parseNumericScore(r?.maxScore, 0)));
     let earnedScore = roundScore2(Math.max(0, parseNumericScore(r?.earnedScore, 0)));
 
     let finalEval = sanitizeTableCell(r?.isFinalCorrect, '');
     let method = sanitizeTableCell(r?.gradingMethod, '');
-    const studentAns = sanitizeTableCell(r?.studentAnswer, '');
+    let studentAns = sanitizeTableCell(r?.studentAnswer, '');
+    let comment = sanitizeTableCell(r?.comment, '');
+
+    const isHallucinated =
+      /không thể đánh giá qua văn bản|giả định thí sinh|giả sử thí sinh/i.test(studentAns) ||
+      /không thể đánh giá qua văn bản|giả định thí sinh|giả sử thí sinh/i.test(comment);
 
     const isBlank =
+      unattemptedSet.has(qCompact) ||
+      isHallucinated ||
       /không làm|bỏ trống|chưa làm/i.test(finalEval) ||
       /^bỏ trống$/i.test(method) ||
-      /^(?:bỏ trống|không làm|chưa làm|không thấy|không có bài|không ghi)$/i.test(studentAns);
+      /^(?:bỏ trống|không làm|chưa làm|không thấy|không có bài|không ghi|không thực hiện)$/i.test(studentAns);
 
     if (isBlank) {
       earnedScore = 0;
+      studentAns = 'Bỏ trống';
       finalEval = 'Không làm';
       method = 'Bỏ trống';
+      comment = 'Thí sinh không làm câu này (0.0đ)';
+    } else if (/^đúng(?:\s+kq(?:\s+cuối)?|\s*\.)?$/i.test(finalEval)) {
+      // Rule: Right final result with valid solution MUST get full maxScore!
+      finalEval = 'Đúng';
+      method = 'Trọn điểm (Đúng KQ cuối)';
+      if (maxScore > 0) {
+        earnedScore = maxScore;
+      }
     } else if (/^(?:sai|thiếu)$/i.test(finalEval) && maxScore > 0 && earnedScore >= maxScore) {
       // Prevent small models from emitting "Sai" while still giving 100% of maxScore
       earnedScore = roundScore2(Math.max(0, maxScore - 0.25));
+      method = earnedScore > 0 ? 'Chấm thành phần (Sai KQ cuối)' : 'Sai / Không có điểm';
     }
 
     if (maxScore > 0) {
@@ -765,7 +790,7 @@ export function enforceMasterRubricOnRows(
       gradingMethod: method || (earnedScore >= maxScore && maxScore > 0 ? 'Trọn điểm (Đúng KQ cuối)' : earnedScore > 0 ? 'Chấm thành phần (Sai KQ cuối)' : 'Sai / Không có điểm'),
       maxScore,
       earnedScore,
-      comment: sanitizeTableCell(r?.comment, earnedScore >= maxScore && maxScore > 0 ? 'Đạt điểm tối đa' : ''),
+      comment: comment || (earnedScore >= maxScore && maxScore > 0 ? 'Đạt điểm tối đa' : ''),
     };
   });
 
@@ -781,6 +806,20 @@ export function enforceMasterRubricOnRows(
     const targetNorm = normalizeQuestionKey(item.question);
     const targetCompact = compactQuestionKey(item.question);
 
+    if (unattemptedSet.has(targetCompact)) {
+      matchedRows.push({
+        question: item.question,
+        requirement: 'Theo đề thi & barem chuẩn',
+        studentAnswer: 'Bỏ trống',
+        isFinalCorrect: 'Không làm',
+        gradingMethod: 'Bỏ trống',
+        maxScore: item.maxScore,
+        earnedScore: 0,
+        comment: 'Thí sinh không làm câu này (0.0đ)',
+      });
+      continue;
+    }
+
     let matchIdx = sanitized.findIndex((r, i) => !usedIndices.has(i) && normalizeQuestionKey(r.question) === targetNorm);
     if (matchIdx === -1 && targetCompact) {
       matchIdx = sanitized.findIndex((r, i) => !usedIndices.has(i) && compactQuestionKey(r.question) === targetCompact);
@@ -790,7 +829,9 @@ export function enforceMasterRubricOnRows(
       usedIndices.add(matchIdx);
       const matched = sanitized[matchIdx];
       let clampedEarned = roundScore2(Math.max(0, Math.min(item.maxScore, matched.earnedScore)));
-      if (/^(?:sai|thiếu)$/i.test(matched.isFinalCorrect || '') && clampedEarned >= item.maxScore && item.maxScore > 0) {
+      if (/^đúng(?:\s+kq(?:\s+cuối)?|\s*\.)?$/i.test(matched.isFinalCorrect || '')) {
+        clampedEarned = item.maxScore;
+      } else if (/^(?:sai|thiếu)$/i.test(matched.isFinalCorrect || '') && clampedEarned >= item.maxScore && item.maxScore > 0) {
         clampedEarned = roundScore2(Math.max(0, item.maxScore - 0.25));
       }
       matchedRows.push({
@@ -829,7 +870,8 @@ export function enforceMasterRubricOnRows(
 export function formatGradingFeedbackFromStructured(
   st: StructuredGradedStudent,
   fallbackStudentName?: string,
-  masterRubric?: string
+  masterRubric?: string,
+  lockedUnattemptedQuestions?: string[]
 ): {
   studentName: string;
   studentId: string;
@@ -843,7 +885,11 @@ export function formatGradingFeedbackFromStructured(
   strengths: string;
   weaknesses: string;
 } {
-  const normalizedRows = enforceMasterRubricOnRows(st.questionRows || [], masterRubric);
+  const normalizedRows = enforceMasterRubricOnRows(
+    st.questionRows || [],
+    masterRubric,
+    lockedUnattemptedQuestions
+  );
   const rawTotal = normalizedRows.reduce((sum, r) => sum + (Number.isFinite(r.earnedScore) ? r.earnedScore : 0), 0);
   const totalScoreNum = roundScore2(Math.max(0, Math.min(10, rawTotal)));
   const score = `${totalScoreNum}/10`;
