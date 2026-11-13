@@ -44,6 +44,65 @@ interface ControlPanelProps {
   setOllamaConfig: React.Dispatch<React.SetStateAction<OllamaConfig>>;
 }
 
+interface FileInputProps {
+  label?: string;
+  file: File | null;
+  setFile: (f: File | null) => void;
+  subtext?: string;
+}
+
+const FileInput: React.FC<FileInputProps> = ({
+  label,
+  file,
+  setFile,
+  subtext,
+}) => (
+  <div className="mb-3">
+    {label && (
+      <label className="block text-xs font-semibold text-gray-700 mb-1 uppercase tracking-wider">
+        {label}
+      </label>
+    )}
+    {subtext && <p className="text-[11px] text-gray-500 mb-1.5">{subtext}</p>}
+    <div className="relative group">
+      {!file ? (
+        <>
+          <input
+            type="file"
+            accept=".docx,.doc,.pdf,.png,.jpg,.jpeg,.txt,.md"
+            onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)}
+            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+          />
+          <div className="border-2 border-dashed border-gray-300 hover:border-teal-400 rounded-lg p-3 flex items-center justify-center transition-colors bg-gray-50">
+            <div className="flex items-center text-gray-500 text-xs gap-1.5">
+              <Upload size={15} />
+              <span>Chọn file (Word .docx, PDF, Ảnh, Text)...</span>
+            </div>
+          </div>
+        </>
+      ) : (
+        <div className="border border-emerald-300 bg-emerald-50 rounded-lg p-2.5 flex items-center justify-between text-xs text-emerald-900 shadow-xs">
+          <div className="flex items-center truncate gap-2 flex-1 mr-2">
+            <CheckCircle size={16} className="text-emerald-600 flex-shrink-0" />
+            <div className="truncate">
+              <span className="font-semibold block truncate" title={file.name}>{file.name}</span>
+              <span className="text-[10px] text-emerald-700 block">{(file.size / 1024).toFixed(0)} KB</span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setFile(null)}
+            className="text-gray-400 hover:text-red-600 p-1 rounded hover:bg-emerald-100 transition-colors cursor-pointer"
+            title="Xóa tệp này"
+          >
+            <X size={15} />
+          </button>
+        </div>
+      )}
+    </div>
+  </div>
+);
+
 const ControlPanel: React.FC<ControlPanelProps> = ({
   onGenerate,
   onGrade,
@@ -241,62 +300,6 @@ const ControlPanel: React.FC<ControlPanelProps> = ({
     setMatrixCounts((prev) => ({ ...prev, [lvl]: val >= 0 ? val : 0 }));
   };
 
-  const FileInput = ({
-    label,
-    file,
-    setFile,
-    subtext,
-  }: {
-    label?: string;
-    file: File | null;
-    setFile: (f: File | null) => void;
-    subtext?: string;
-  }) => (
-    <div className="mb-3">
-      {label && (
-        <label className="block text-xs font-semibold text-gray-700 mb-1 uppercase tracking-wider">
-          {label}
-        </label>
-      )}
-      {subtext && <p className="text-[11px] text-gray-500 mb-1.5">{subtext}</p>}
-      <div className="relative group">
-        {!file ? (
-          <>
-            <input
-              type="file"
-              accept=".docx,.doc,.pdf,.png,.jpg,.jpeg,.txt,.md"
-              onChange={(e) => setFile(e.target.files ? e.target.files[0] : null)}
-              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
-            />
-            <div className="border-2 border-dashed border-gray-300 hover:border-teal-400 rounded-lg p-3 flex items-center justify-center transition-colors bg-gray-50">
-              <div className="flex items-center text-gray-500 text-xs gap-1.5">
-                <Upload size={15} />
-                <span>Chọn file (Word .docx, PDF, Ảnh, Text)...</span>
-              </div>
-            </div>
-          </>
-        ) : (
-          <div className="border border-emerald-300 bg-emerald-50 rounded-lg p-2.5 flex items-center justify-between text-xs text-emerald-900 shadow-xs">
-            <div className="flex items-center truncate gap-2 flex-1 mr-2">
-              <CheckCircle size={16} className="text-emerald-600 flex-shrink-0" />
-              <div className="truncate">
-                <span className="font-semibold block truncate" title={file.name}>{file.name}</span>
-                <span className="text-[10px] text-emerald-700 block">{(file.size / 1024).toFixed(0)} KB</span>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setFile(null)}
-              className="text-gray-400 hover:text-red-600 p-1 rounded hover:bg-emerald-100 transition-colors cursor-pointer"
-              title="Xóa tệp này"
-            >
-              <X size={15} />
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
 
   return (
     <div className="h-full flex flex-col bg-white border-r border-gray-200 shadow-xl overflow-y-auto">

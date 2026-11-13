@@ -6,6 +6,31 @@ import { generateExamContentOllama, gradeSingleSubmissionOllama } from './servic
 import { ExamConfig, GeneratedContent, GradingConfig, GradingResult, StudentGradingResult, AIProvider, OllamaConfig } from './types';
 import { BookOpen, FileCheck, AlertCircle, FileText, FileType, Cpu, Server, Sparkles, Users, Award, CheckCircle2, Clock, XCircle, Search, Download, RotateCw, AlertTriangle, X } from 'lucide-react';
 
+interface DownloadActionsProps {
+  content: string;
+  prefix: string;
+  onDownload: (content: string, filename: string, type: 'txt' | 'doc') => void;
+}
+
+const DownloadActions: React.FC<DownloadActionsProps> = ({ content, prefix, onDownload }) => (
+  <div className="flex gap-2">
+    <button 
+      onClick={() => onDownload(content, `${prefix}.doc`, 'doc')}
+      className="flex items-center gap-1 text-xs bg-blue-100 hover:bg-blue-200 text-blue-800 px-2 py-1 rounded transition-colors"
+      title="Tải về file Word"
+    >
+      <FileType size={14} /> Word
+    </button>
+    <button 
+      onClick={() => onDownload(content, `${prefix}.txt`, 'txt')}
+      className="flex items-center gap-1 text-xs bg-gray-100 hover:bg-gray-200 text-gray-800 px-2 py-1 rounded transition-colors"
+      title="Tải về file Text"
+    >
+      <FileText size={14} /> .txt
+    </button>
+  </div>
+);
+
 const App: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [generatedContent, setGeneratedContent] = useState<GeneratedContent | null>(null);
@@ -78,6 +103,50 @@ const App: React.FC = () => {
     }
   };
 
+  const extractMasterRubric = (feedback: string): string => {
+    if (!feedback) return '';
+    const lines = feedback.split(/\r?\n/);
+    const rows: string[] = [];
+    let inTable = false;
+    let nameCol = 1;
+    let maxCol = 2;
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('|') || !trimmed.endsWith('|')) {
+        if (inTable && rows.length > 0) break;
+        continue;
+      }
+      if (/^\|\s*[: -]+\s*\|/.test(trimmed)) continue;
+
+      const cells = trimmed.split('|').slice(1, -1).map(c => c.trim());
+      const lower = trimmed.toLowerCase();
+
+      if (lower.includes('câu hỏi') || lower.includes('câu / ý') || lower.includes('thang điểm')) {
+        inTable = true;
+        for (let cIdx = 0; cIdx < cells.length; cIdx++) {
+          const cLower = cells[cIdx].toLowerCase();
+          if (cLower.includes('câu hỏi') || cLower.includes('câu / ý') || cLower === 'câu') nameCol = cIdx;
+          if (cLower.includes('thang điểm') || cLower.includes('thang')) maxCol = cIdx;
+        }
+        continue;
+      }
+
+      if (inTable) {
+        if (lower.includes('tổng cộng') || lower.includes('tổng điểm')) continue;
+        if (cells.length > Math.max(nameCol, maxCol)) {
+          const qName = cells[nameCol];
+          const qMax = cells[maxCol];
+          if (qName && qMax && /\d/.test(qMax)) {
+            rows.push(`- ${qName}: Thang điểm tối đa ${qMax}`);
+          }
+        }
+      }
+    }
+
+    return rows.length > 0 ? rows.join('\n') : '';
+  };
+
   const [lastGradingConfig, setLastGradingConfig] = useState<GradingConfig | null>(null);
 
   const handleRetryStudent = async (studentId: string, forceProvider?: 'gemini' | 'ollama') => {
@@ -90,11 +159,17 @@ const App: React.FC = () => {
     setStudentResults(prev => prev.map(s => s.id === studentId ? { ...s, status: 'grading', error: undefined } : s));
 
     const activeProvider = forceProvider || provider;
+    
+    // Find master rubric from any already completed student to ensure consistency
+    const existingDone = studentResults.find(s => s.id !== studentId && s.status === 'done' && s.feedback);
+    const retryMasterRubric = existingDone ? extractMasterRubric(existingDone.feedback) : undefined;
+
     const retryOptions = {
       examQuestionFile: lastGradingConfig.examQuestionFile,
       examQuestionText: lastGradingConfig.examQuestionText,
       answerKeyText: lastGradingConfig.answerKeyText,
       fastFinalResultGrading: lastGradingConfig.fastFinalResultGrading,
+      masterRubric: retryMasterRubric,
     };
 
     try {
@@ -185,6 +260,8 @@ const App: React.FC = () => {
       fastFinalResultGrading: config.fastFinalResultGrading,
     };
 
+    let sharedMasterRubric = '';
+
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       const placeholderStudentId = initialStudents[i].id;
@@ -198,18 +275,32 @@ const App: React.FC = () => {
       // Mark current student placeholder as grading
       setStudentResults(prev => prev.map(s => s.id === placeholderStudentId ? { ...s, status: 'grading' } : s));
 
+      const currentGradingOptions = {
+        ...gradingOptions,
+        masterRubric: sharedMasterRubric || undefined,
+      };
+
       try {
         let res: any;
         if (provider === 'ollama') {
           try {
-            res = await gradeSingleSubmissionOllama(file, config.answerKeyFile, config.gradingType, ollamaConfig, file.name, gradingOptions);
+            res = await gradeSingleSubmissionOllama(file, config.answerKeyFile, config.gradingType, ollamaConfig, file.name, currentGradingOptions);
           } catch (ollamaErr: any) {
             console.warn(`Ollama không khả dụng cho file ${file.name}, tự động chuyển sang Gemini Cloud AI:`, ollamaErr.message);
-            res = await gradeSingleSubmission(file, config.answerKeyFile, config.gradingType, file.name, gradingOptions);
+            res = await gradeSingleSubmission(file, config.answerKeyFile, config.gradingType, file.name, currentGradingOptions);
             setOllamaFallbackNotice("Ollama cục bộ tại localhost:11434 không phản hồi (chưa khởi chạy hoặc chặn kết nối). Hệ thống đã tự động chuyển sang Gemini Cloud AI để hoàn tất chấm bài mà không bị gián đoạn.");
           }
         } else {
-          res = await gradeSingleSubmission(file, config.answerKeyFile, config.gradingType, file.name, gradingOptions);
+          res = await gradeSingleSubmission(file, config.answerKeyFile, config.gradingType, file.name, currentGradingOptions);
+        }
+
+        // Anchor master rubric from first completed student so all subsequent students share the EXACT same rubric
+        if (!sharedMasterRubric && (res.content || res.feedback)) {
+          const extracted = extractMasterRubric(res.content || res.feedback);
+          if (extracted) {
+            sharedMasterRubric = extracted;
+            console.log("Anchored shared master rubric across all submissions in batch:\n", sharedMasterRubric);
+          }
         }
 
         const detectedStudents = res.students && res.students.length > 0 ? res.students : [{
@@ -491,25 +582,6 @@ const App: React.FC = () => {
     }, 100);
   };
 
-  const DownloadActions = ({ content, prefix }: { content: string, prefix: string }) => (
-      <div className="flex gap-2">
-          <button 
-            onClick={() => downloadFile(content, `${prefix}.doc`, 'doc')}
-            className="flex items-center gap-1 text-xs bg-blue-100 hover:bg-blue-200 text-blue-800 px-2 py-1 rounded transition-colors"
-            title="Tải về file Word"
-          >
-            <FileType size={14} /> Word
-          </button>
-          <button 
-            onClick={() => downloadFile(content, `${prefix}.txt`, 'txt')}
-            className="flex items-center gap-1 text-xs bg-gray-100 hover:bg-gray-200 text-gray-800 px-2 py-1 rounded transition-colors"
-            title="Tải về file Text"
-          >
-            <FileText size={14} /> .txt
-          </button>
-      </div>
-  );
-
   return (
     <div className="flex h-screen w-full overflow-hidden bg-gray-50">
       {/* Left Sidebar (30%) - Control Panel now on the left */}
@@ -608,7 +680,7 @@ const App: React.FC = () => {
                     <div className="bg-white rounded-xl shadow-sm border border-gray-200 flex flex-col h-fit min-h-full">
                         <div className="p-4 border-b border-gray-100 bg-gray-50 rounded-t-xl flex justify-between items-center">
                             <h3 className="font-bold text-gray-700 uppercase text-sm tracking-wide">Nội dung Đề bài</h3>
-                            <DownloadActions content={generatedContent.questions} prefix="de_thi" />
+                            <DownloadActions content={generatedContent.questions} prefix="de_thi" onDownload={downloadFile} />
                         </div>
                         <div className="p-6">
                             <MarkdownRenderer content={generatedContent.questions} />
@@ -619,7 +691,7 @@ const App: React.FC = () => {
                     <div className="bg-white rounded-xl shadow-sm border border-gray-200 flex flex-col h-fit min-h-full">
                          <div className="p-4 border-b border-gray-100 bg-blue-50 rounded-t-xl flex justify-between items-center">
                             <h3 className="font-bold text-blue-700 uppercase text-sm tracking-wide">Đáp án & Thang điểm</h3>
-                            <DownloadActions content={generatedContent.answers} prefix="dap_an" />
+                            <DownloadActions content={generatedContent.answers} prefix="dap_an" onDownload={downloadFile} />
                         </div>
                         <div className="p-6">
                             <MarkdownRenderer content={generatedContent.answers} />
@@ -976,6 +1048,7 @@ ${s.feedback || 'Chưa có nội dung phiếu chấm'}
                                   <DownloadActions 
                                     content={`# PHIẾU CHẤM ĐIỂM THI: ${current.studentName}\n${current.studentId ? `- **MSSV / SBD:** ${current.studentId}\n` : ''}${current.className ? `- **Lớp:** ${current.className}\n` : ''}${current.examCode ? `- **Mã đề:** ${current.examCode}\n` : ''}- **Tệp bài làm gốc:** ${current.fileName}\n- **Điểm số chính thức:** ${current.score}\n\n${current.feedback}`} 
                                     prefix={`phieu_cham_${current.studentName.replace(/\s+/g, '_')}`} 
+                                    onDownload={downloadFile}
                                   />
                                 </div>
                               )}

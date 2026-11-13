@@ -308,6 +308,7 @@ export const gradeSingleSubmissionOllama = async (
     examQuestionText?: string;
     answerKeyText?: string;
     fastFinalResultGrading?: boolean;
+    masterRubric?: string;
   }
 ): Promise<{ 
   students: any[];
@@ -320,6 +321,10 @@ export const gradeSingleSubmissionOllama = async (
 }> => {
   const images: string[] = [];
   let extraText = '';
+
+  if (options?.masterRubric && options.masterRubric.trim()) {
+    extraText += `\n--- BẢNG BAREM THANG ĐIỂM BẮT BUỘC DÙNG CHUNG ---\n${options.masterRubric.trim()}\nBẮT BUỘC DÙNG ĐÚNG BẢNG BAREM NÀY: Mọi bài thi đều phải có đủ các câu trên. Câu nào không làm cho 0.0đ. Không được đổi thang điểm.\n`;
+  }
 
   if (options?.examQuestionFile) {
     const qExtracted = await extractFileContent(options.examQuestionFile);

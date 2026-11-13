@@ -4,7 +4,7 @@ import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 
 async function startServer() {
     const app = express();
-    const PORT = 3000;
+    const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
     app.use(express.json({ limit: '50mb' }));
 
@@ -295,12 +295,18 @@ async function startServer() {
                 examQuestionText,
                 answerKeyPart, 
                 answerKeyText,
+                masterRubric,
                 fastFinalResultGrading = true,
                 gradingType = 'auto'
             } = req.body;
 
             const parts: any[] = Array.isArray(rawParts) ? [...rawParts] : [];
             
+            // If a shared master rubric is provided, force it as the top priority anchoring
+            if (masterRubric && typeof masterRubric === 'string' && masterRubric.trim()) {
+                parts.push({ text: `[BẢNG BAREM THANG ĐIỂM BẮT BUỘC DÙNG CHUNG CHO TẤT CẢ CÁC BÀI THI]:\n${masterRubric.trim()}\n\nQUY TẮC CỐ ĐỊNH BAREM: Bắt buộc liệt kê đầy đủ tất cả các câu trên vào bảng điểm của thí sinh này. Câu nào thí sinh không giải/bỏ trống bắt buộc ghi rõ vào bảng và cho 0.0đ. Tuyệt đối không được thay đổi thang điểm tối đa của từng câu.` });
+            }
+
             // Add exam question paper if provided
             if (examQuestionText && typeof examQuestionText === 'string' && examQuestionText.trim()) {
                 parts.push({ text: `[NỘI DUNG ĐỀ BÀI (ĐỀ THI GỐC) ĐƯỢC GIÁO VIÊN CUNG CẤP]:\n${examQuestionText.trim()}\n` });
@@ -338,47 +344,50 @@ QUY TẮC BẮT BUỘC ĐỂ ĐẢM BẢO TÍNH ỔN ĐỊNH VÀ CÔNG BẰNG 10
    - TẤT CẢ CÁC BÀI THI trong cùng đợt chấm đều BẮT BUỘC PHẢI DÙNG CHUNG ĐÚNG 1 BẢNG BAREM NÀY. Thang điểm của từng câu không được thay đổi bất thường giữa các thí sinh hay giữa các lần chấm.
 
 2. CÔNG BẰNG TUYỆT ĐỐI & CHỐNG ĐẢO NGƯỢC THỨ HẠNG (ANTI-INVERSION):
-   - Bài làm có chất lượng tốt hơn (làm nhiều câu hơn, giải đúng các bước hơn) BẮT BUỘC PHẢI CÓ ĐIỂM CAO HƠN bài làm kém hơn (bỏ câu, làm sai cơ bản).
-   - BỎ TRỐNG / KHÔNG LÀM: Bất kỳ câu nào thí sinh không giải hoặc bỏ trống (ví dụ: không có bài làm cho câu 2c, 2d), BẮT BUỘC CHO 0.0 ĐIỂM cho câu đó.
-   - CHỐNG ĐOÁN MÒ / GHI BỪA SỐ: Để được công nhận "Đúng kết quả cuối cùng", thí sinh BẮT BUỘC PHẢI CÓ CÁC BƯỚC BIẾN ĐỔI / CÔNG THỨC / LỜI GIẢI TƯƠNG ỨNG trong bài thi dẫn đến kết quả đó.
+   - Thí sinh làm nhiều câu hơn, giải đúng nhiều bước hơn BẮT BUỘC PHẢI CÓ ĐIỂM CAO HƠN thí sinh bỏ câu, làm ít hoặc làm sai.
+   - BỎ TRỐNG / KHÔNG LÀM: Bất kỳ câu nào thí sinh không giải hoặc bỏ trống trong bài làm (ví dụ: không làm câu 2c, 2d), BẮT BUỘC CHO 0.0 ĐIỂM cho câu đó trong Bảng điểm chi tiết.
+   - CHỐNG ĐOÁN MÒ / GHI BỪA SỐ: Để được công nhận "Đúng kết quả cuối cùng", thí sinh BẮT BUỘC PHẢI CÓ CÁC BƯỚC BIẾN ĐỔI / CÔNG THỨC / LỜI GIẢI HỢP LÝ trong bài thi dẫn đến kết quả đó.
      * Nếu thí sinh chỉ ghi trơ trọi một con số kết quả mà hoàn toàn không có lời giải/bước tính: KHÔNG ĐƯỢC CHO TRỌN ĐIỂM (tối đa chỉ 0.25đ phần đáp số nếu đúng số).
-     * Tuyệt đối không cho điểm nếu thí sinh chỉ ghi bừa kết quả mà không làm bài.
+     * Tuyệt đối không cho điểm nếu thí sinh ghi bừa kết quả mà không làm bài.
+   - CHẤM THÀNH PHẦN CÔNG BẰNG CHO THÍ SINH GIẢI ĐÚNG BẢN CHẤT:
+     * Thí sinh viết đúng công thức gốc, biến đổi đúng phương pháp nhưng chỉ tính nhầm số học ở bước cuối: BẮT BUỘC cho điểm các bước làm đúng (chiếm 60% - 80% số điểm của câu), chỉ trừ phần điểm đáp số cuối (20% - 40%). Tuyệt đối không được trừ sạch điểm của thí sinh giải đúng phương pháp.
 
 3. QUY TRÌNH CHẤM THEO KẾT QUẢ CUỐI CÙNG & THÀNH PHẦN:
    - Với MỖI câu hỏi / ý:
      + BƯỚC 1: Kiểm tra xem thí sinh có giải câu này không. Nếu BỎ TRỐNG -> Cho 0.0đ.
      + BƯỚC 2: Kiểm tra Lời giải & Kết quả cuối cùng:
-       * NẾU CÓ LỜI GIẢI VÀ ĐÁP ÁN CUỐI CÙNG ĐÚNG (kể cả kèm đơn vị đo theo đề bài): Cho ngay ĐIỂM TỐI ĐA TRỌN VẸN của câu đó (Cách chấm áp dụng: "Trọn điểm (Đúng KQ cuối)").
-       * NẾU KẾT QUẢ CUỐI CÙNG SAI / THIẾU / TÍNH NHẦM: MỚI BẮT ĐẦU rà soát từng thành phần theo barem điểm từng bước (Công thức gốc -> Biến đổi -> Thay số). Cho điểm thành phần ở các bước thí sinh làm đúng, chỉ trừ điểm ở bước tính sai (Cách chấm áp dụng: "Chấm thành phần (Sai KQ cuối)").
+       * NẾU CÓ LỜI GIẢI HỢP LÝ VÀ ĐÁP ÁN CUỐI CÙNG ĐÚNG (kể cả kèm đơn vị đo theo đề bài): Cho ngay ĐIỂM TỐI ĐA TRỌN VẸN của câu đó (Cách chấm áp dụng: "Trọn điểm (Đúng KQ cuối)").
+       * NẾU KẾT QUẢ CUỐI CÙNG SAI / THIẾU / TÍNH NHẦM: Rà soát từng thành phần theo barem điểm từng bước (Công thức gốc -> Biến đổi -> Thay số). Cho điểm thành phần ở các bước thí sinh làm đúng, chỉ trừ điểm ở bước tính sai (Cách chấm áp dụng: "Chấm thành phần (Sai KQ cuối)").
 
-4. KHUÔN MẪU PHIẾU CHẤM CỐ ĐỊNH DUY NHẤT 100% (UNIFORM REPORT TEMPLATE):
-Mọi bài thi đều phải xuất ra phiếu chấm trong trường "feedback" theo đúng chuẩn mực sau:
+4. PHIẾU CHẤM ĐIỂM CHUẨN ĐẠI HỌC (KHUÔN MẪU PHIÊN BẢN CŨ):
+Mọi bài thi đều phải xuất ra phiếu chấm trong trường "feedback" theo đúng chuẩn mẫu cũ sau:
 
 # PHIẾU CHẤM ĐIỂM THI KẾT THÚC HỌC PHẦN
 
-### I. THÔNG TIN THÍ SINH & BÀI THI
-| Họ và tên thí sinh: **[Họ tên thật của thí sinh trích xuất từ bài thi]** | MSSV / SBD: **[MSSV hoặc N/A]** |
-| Lớp / Đơn vị: **[Lớp hoặc N/A]** | Mã đề thi: **[Mã đề hoặc N/A]** |
+- **Họ và tên thí sinh:** [Họ tên thật của thí sinh trích xuất từ bài thi]
+- **Mã số sinh viên (MSSV / SBD):** [MSSV hoặc Không có]
+- **Lớp / Khóa:** [Lớp hoặc Không có]
+- **Mã đề thi:** [Mã đề hoặc Không có]
 
-### II. BẢNG BAREM & ĐIỂM CHI TIẾT TỪNG CÂU
-| STT | Câu hỏi / Ý | Thang điểm | Lời giải & Kết quả của thí sinh | Kết quả cuối | Cách chấm áp dụng | Điểm đạt | Nhận xét chi tiết theo Barem |
-| :---: | :--- | :---: | :--- | :---: | :--- | :---: | :--- |
-[Liệt kê đầy đủ mọi câu từ Câu 1 đến câu cuối cùng theo đúng barem, không được bỏ sót câu nào]
+### BẢNG ĐIỂM CHI TIẾT TỪNG CÂU
+| Câu / Ý | Yêu cầu đề bài | Kết quả cuối của HS | Đánh giá KQ cuối | Phương thức chấm | Thang điểm | Điểm đạt | Nhận xét chi tiết (Thành phần nếu sai) |
+| :---: | :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+[Liệt kê đầy đủ mọi câu từ Câu 1 đến câu cuối cùng theo đúng barem đề thi, không được bỏ sót câu nào]
 
-### III. TỔNG KẾT ĐÁNH GIÁ & XẾP LOẠI
-- **TỔNG ĐIỂM CHÍNH THỨC:** **[X.XX] / 10** (*Bằng chữ: [Ghi điểm bằng chữ]* )
+### TỔNG KẾT ĐÁNH GIÁ & XẾP LOẠI
+- **TỔNG ĐIỂM CHÍNH THỨC:** **[X.X] / 10** (*Bằng chữ: [Ghi điểm bằng chữ]*)
 - **Thang điểm 4:** **[Y.Y / 4.0]** | **Điểm chữ:** **[A/B/C/D/F]**
-- **Xếp loại học lực:** **[Xuất sắc / Giỏi / Khá / Trung bình / Chưa đạt]**
-- **Quy tắc chấm áp dụng:** Ưu tiên kết quả cuối cùng (kèm lời giải hợp lệ); Sai kết quả cuối chấm điểm thành phần
-- **Ưu điểm bài làm:** [Nêu ưu điểm nổi bật cụ thể]
-- **Tồn tại / Thiếu sót:** [Chỉ rõ các câu chưa làm hoặc sai sót kiến thức]
+- **Xếp loại:** **[Xuất sắc / Giỏi / Khá / Trung bình / Chưa đạt]**
+- **Nhận xét chung:**
+  - **Ưu điểm:** [Nêu ưu điểm của bài làm]
+  - **Hạn chế / Lưu ý:** [Nêu các điểm sai sót hoặc câu chưa làm]
 
-| **CÁN BỘ CHẤM THI 1** | **CÁN BỘ CHẤM THI 2** |
+| CÁN BỘ CHẤM THI 1 | CÁN BỘ CHẤM THI 2 |
 | :---: | :---: |
 | *(Ký và ghi rõ họ tên)* | *(Ký và ghi rõ họ tên)* |
 
-5. KHÔNG SAI LỆCH SỐ HỌC (ARITHMETIC INTEGRITY):
-   Tổng điểm tại trường "score", "totalScoreNum" và mục "TỔNG ĐIỂM CHÍNH THỨC" BẮT BUỘC PHẢI BẰNG ĐÚNG TỔNG CỘNG ĐIỂM ĐẠT CỦA TẤT CẢ CÁC CÂU trong Bảng điểm chi tiết!
+5. CỘNG ĐIỂM CHÍNH XÁC TUYỆT ĐỐI (ARITHMETIC INTEGRITY):
+   - "totalScoreNum" và "score" BẮT BUỘC PHẢI BẰNG ĐÚNG tổng cộng điểm đạt của từng câu trong Bảng điểm chi tiết (ví dụ: các câu trong bảng cộng lại ra 6.5 thì totalScoreNum phải là 6.5 và score là "6.5/10", tuyệt đối không được ghi sai lệch).
 `;
 
             const gradingSchema = {
@@ -461,9 +470,127 @@ Mọi bài thi đều phải xuất ra phiếu chấm trong trường "feedback"
                     }
                 ];
 
-            // Ensure mathematical synchronization
+    function numberToVietnameseScore(num: number): string {
+        const digitWords = ["Không", "Một", "Hai", "Ba", "Bốn", "Năm", "Sáu", "Bảy", "Tám", "Chín", "Mười"];
+        const rounded = Math.round(num * 100) / 100;
+        const intPart = Math.floor(rounded);
+        const decPart = Math.round((rounded - intPart) * 100);
+        let res = digitWords[intPart] || intPart.toString();
+        if (decPart > 0) {
+            if (decPart % 10 === 0) {
+                const d = decPart / 10;
+                res += " phẩy " + (d === 5 ? "năm" : (digitWords[d] ? digitWords[d].toLowerCase() : d));
+            } else if (decPart < 10) {
+                res += " phẩy không " + (digitWords[decPart] ? digitWords[decPart].toLowerCase() : decPart);
+            } else {
+                const d1 = Math.floor(decPart / 10);
+                const d2 = decPart % 10;
+                const w1 = d1 === 7 ? "bảy" : (digitWords[d1] ? digitWords[d1].toLowerCase() : d1);
+                const w2 = d2 === 5 ? "lăm" : (digitWords[d2] ? digitWords[d2].toLowerCase() : d2);
+                res += " phẩy " + w1 + " " + w2;
+            }
+        }
+        return res;
+    }
+
+    function extractExactScoreFromFeedback(md: string): number | null {
+        if (!md || typeof md !== 'string') return null;
+
+        // 1. Try extracting from Table "Điểm đạt"
+        const lines = md.split(/\r?\n/);
+        let headerCol = -1;
+        const scores: number[] = [];
+
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) continue;
+            if (/^\|\s*[: -]+\s*\|/.test(trimmed)) continue;
+
+            const cells = trimmed.split("|").slice(1, -1).map(c => c.trim());
+
+            if (headerCol === -1) {
+                for (let i = 0; i < cells.length; i++) {
+                    const c = cells[i].toLowerCase();
+                    if (c.includes("điểm đạt") || c.includes("điểm số") || (c.includes("điểm") && !c.includes("thang"))) {
+                        headerCol = i;
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            const rowText = trimmed.toLowerCase();
+            if (rowText.includes("tổng cộng") || rowText.includes("tổng điểm")) continue;
+
+            if (cells.length > headerCol) {
+                const clean = cells[headerCol].replace(/[^\d.,]/g, "").replace(",", ".");
+                const val = parseFloat(clean);
+                if (!isNaN(val)) {
+                    scores.push(val);
+                }
+            }
+        }
+
+        if (scores.length > 0) {
+            const total = scores.reduce((a, b) => a + b, 0);
+            return Math.max(0, Math.min(10, Math.round(total * 100) / 100));
+        }
+
+        // 2. Fallback: Try extracting from addition expression before "="
+        const match = md.match(/-\s*\*\*Chi tiết cộng điểm:\*\*\s*(.*?)(?=\n|$)/i);
+        if (match) {
+            const lhs = match[1].split("=")[0];
+            const nums = (lhs.match(/\d+(?:[.,]\d+)?/g) || []).map(n => parseFloat(n.replace(",", ".")));
+            if (nums.length > 0) {
+                const total = nums.reduce((a, b) => a + b, 0);
+                return Math.max(0, Math.min(10, Math.round(total * 100) / 100));
+            }
+        }
+
+        return null;
+    }
+
+            // Programmatically calculate exact score sum from individual questions in table
             for (const st of students) {
-                if (typeof st.totalScoreNum === 'number') {
+                const exactScore = extractExactScoreFromFeedback(st.feedback);
+                if (exactScore !== null) {
+                    st.totalScoreNum = exactScore;
+                    st.score = `${exactScore}/10`;
+                    st.scoreText = numberToVietnameseScore(exactScore);
+
+                    // Synchronize feedback markdown
+                    let fb = st.feedback;
+                    fb = fb.replace(/(-\s*\*\*Chi tiết cộng điểm:\*\*.*?=)\s*[\d.,]+\s*đ?/i, `$1 ${exactScore}đ`);
+                    fb = fb.replace(/(-\s*\*\*(?:TỔNG ĐIỂM CHÍNH THỨC|Tổng điểm chính thức|Tổng điểm):\*\*\s*\*\*?).*?(\/\s*10\*\*?)/i, `$1${exactScore} $2`);
+                    fb = fb.replace(/(\*Bằng chữ:\s*)[^*]+(\*)/i, `$1${st.scoreText}$2`);
+
+                    let gpa4 = 0.0;
+                    let gradeLetter = 'F';
+                    let rank = 'Chưa đạt';
+
+                    if (exactScore >= 8.5) {
+                        gpa4 = 4.0; gradeLetter = 'A'; rank = 'Xuất sắc';
+                    } else if (exactScore >= 8.0) {
+                        gpa4 = 3.5; gradeLetter = 'B+'; rank = 'Giỏi';
+                    } else if (exactScore >= 7.0) {
+                        gpa4 = 3.0; gradeLetter = 'B'; rank = 'Khá';
+                    } else if (exactScore >= 6.5) {
+                        gpa4 = 2.5; gradeLetter = 'C+'; rank = 'Trung bình khá';
+                    } else if (exactScore >= 5.5) {
+                        gpa4 = 2.0; gradeLetter = 'C'; rank = 'Trung bình';
+                    } else if (exactScore >= 5.0) {
+                        gpa4 = 1.5; gradeLetter = 'D+'; rank = 'Trung bình yếu';
+                    } else if (exactScore >= 4.0) {
+                        gpa4 = 1.0; gradeLetter = 'D'; rank = 'Đạt (yếu)';
+                    } else {
+                        gpa4 = 0.0; gradeLetter = 'F'; rank = 'Chưa đạt (Kém)';
+                    }
+
+                    fb = fb.replace(/(-\s*\*\*Thang điểm 4:\*\*\s*\*\*).*?(?=\n|$)/i, `- **Thang điểm 4:** **${gpa4.toFixed(1)} / 4.0** | **Điểm chữ:** **${gradeLetter}**`);
+                    fb = fb.replace(/(-\s*\*\*(?:Xếp loại|Xếp loại học lực):\*\*\s*\*\*).*?(?=\n|$)/i, `- **Xếp loại:** **${rank}**`);
+
+                    st.feedback = fb;
+                } else if (typeof st.totalScoreNum === 'number') {
                     const rounded = Math.round(st.totalScoreNum * 100) / 100;
                     st.score = `${rounded}/10`;
                 }
@@ -493,6 +620,8 @@ Mọi bài thi đều phải xuất ra phiếu chấm trong trường "feedback"
     if (process.env.NODE_ENV !== "production") {
         const { createServer } = await import("vite");
         const vite = await createServer({
+            configFile: path.resolve(process.cwd(), 'vite.config.ts'),
+            root: process.cwd(),
             server: { middlewareMode: true },
             appType: "spa",
         });

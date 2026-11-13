@@ -186,6 +186,7 @@ export const gradeSingleSubmission = async (
       examQuestionText?: string;
       answerKeyText?: string;
       fastFinalResultGrading?: boolean;
+      masterRubric?: string;
     }
 ): Promise<{ 
     students: GradedStudentItem[];
@@ -277,6 +278,7 @@ export const gradeSingleSubmission = async (
                     body: JSON.stringify({ 
                         prompt, 
                         parts,
+                        masterRubric: options?.masterRubric,
                         fastFinalResultGrading: fastRule,
                         gradingType
                     }),

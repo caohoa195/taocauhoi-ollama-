@@ -17,7 +17,23 @@ export default defineConfig(({ mode }) => {
       resolve: {
         alias: {
           '@': path.resolve(__dirname, '.'),
-        }
+        },
+        dedupe: ['react', 'react-dom']
+      },
+      optimizeDeps: {
+        include: [
+          'react',
+          'react-dom',
+          'react-dom/client',
+          'react/jsx-runtime',
+          'react/jsx-dev-runtime',
+          'lucide-react',
+          'react-markdown',
+          'remark-gfm',
+          'remark-math',
+          'rehype-katex'
+        ]
       }
     };
 });
+
