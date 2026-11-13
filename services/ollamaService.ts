@@ -438,8 +438,31 @@ export const gradeSingleSubmissionOllama = async (
     referenceText += `\n[NỘI DUNG ĐÁP ÁN CHUẨN & THANG ĐIỂM ĐƯỢC GIÁO VIÊN CUNG CẤP]:\n${options.answerKeyText.trim()}\n`;
   }
 
-  // Step 1A: Dedicated 1-image OCR for rotated right-margin student info strip (phách dọc)
-  let headerOcrText = '';
+  const isBannedOrEmptyMeta = (val?: string): boolean => {
+    const v = (val || '').trim();
+    if (!v) return true;
+    const lower = v.toLowerCase();
+    const banned = [
+      'nguyen thi hoa',
+      'nguyễn thị hoa',
+      'nguyễn minh anh',
+      'nguyễn thị minh anh',
+      'nguyễn văn a',
+      '2022123456',
+      '12a1001',
+      '12a1',
+      'k65',
+      'không đọc được',
+      'không rõ',
+      'không có',
+      'chưa rõ',
+      'n/a',
+    ];
+    return banned.some((b) => lower.includes(b));
+  };
+
+  // Step 1A: Focused 1-image JSON read on rotated right-margin student info strip (phách dọc)
+  const headerInfo: { studentName?: string; studentId?: string; className?: string; examCode?: string } = {};
   if (subRes.headerCropImage) {
     try {
       const hdrData = await callOllamaApi(
@@ -449,21 +472,21 @@ export const gradeSingleSubmissionOllama = async (
           model: ollamaConfig.model,
           messages: [
             {
-              role: 'system',
-              content: 'Bạn chỉ đọc thông tin thí sinh trên ảnh tiêu đề/phách đã xoay ngang. Tuyệt đối không bịa tên nếu không nhìn thấy chữ.',
-            },
-            {
               role: 'user',
-              content: `Đọc ảnh phần phách tiêu đề của bài thi "${submissionFile.name}". Ghi đúng nguyên văn các thông tin thực sự nhìn thấy:
-- Họ và tên thí sinh: [nếu không có hoặc mờ ghi "Không đọc được"]
-- MSSV / SBD: [nếu không có ghi "Không có"]
-- Lớp / Khóa: [nếu không có ghi "Không có"]
-- Mã đề thi: [nếu không có ghi "Không có"]
-TUYỆT ĐỐI KHÔNG tự bịa tên (cấm bịa NGUYEN THI HOA, Nguyễn Minh Anh, Nguyễn Văn A...).`,
+              content: `Ảnh này là phần tiêu đề/phách bên lề giấy thi của "${submissionFile.name}" đã được xoay ngang.
+Hãy đọc chữ viết tay/chữ in thực tế trên ảnh và trả về DUY NHẤT JSON theo mẫu:
+{
+  "studentName": "Họ và tên thí sinh viết trên dòng Họ và tên (để chuỗi rỗng \"\" nếu không thấy)",
+  "studentId": "Số báo danh hoặc MSSV nếu có (để \"\" nếu không có)",
+  "className": "Tên lớp nếu có trên dòng Lớp (để \"\" nếu không có)",
+  "examCode": "Mã đề nếu có (để \"\" nếu không có)"
+}
+TUYỆT ĐỐI KHÔNG tự bịa tên hay mã số giả.`,
               images: [subRes.headerCropImage],
             },
           ],
           stream: false,
+          format: 'json',
           options: {
             temperature: 0.0,
             seed: 42,
@@ -472,90 +495,97 @@ TUYỆT ĐỐI KHÔNG tự bịa tên (cấm bịa NGUYEN THI HOA, Nguyễn Minh
         },
         false
       );
-      headerOcrText = (hdrData?.message?.content || hdrData?.response || '')
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .trim();
+      const hdrRaw = hdrData?.message?.content || hdrData?.response || '';
+      if (hdrRaw) {
+        const parsedHdr = parseJsonWithLatexFix(hdrRaw);
+        if (!isBannedOrEmptyMeta(parsedHdr?.studentName)) headerInfo.studentName = String(parsedHdr.studentName).trim();
+        if (!isBannedOrEmptyMeta(parsedHdr?.studentId)) headerInfo.studentId = String(parsedHdr.studentId).trim();
+        if (!isBannedOrEmptyMeta(parsedHdr?.className)) headerInfo.className = String(parsedHdr.className).trim();
+        if (!isBannedOrEmptyMeta(parsedHdr?.examCode)) headerInfo.examCode = String(parsedHdr.examCode).trim();
+      }
     } catch (hdrErr: any) {
       if (isVisionUnsupportedError(hdrErr?.message || '')) {
         if (!submissionHasText) throw hdrErr;
       } else {
-        console.warn('Header phách OCR notice:', hdrErr);
+        console.warn('Header phách JSON read notice:', hdrErr);
       }
     }
   }
 
-  // Step 1B: Focused 1-image-per-page Vision OCR across ALL pages of the student's paper
-  let transcribedPagesText = '';
-  const looksLikeMissingImageReply = (txt: string): boolean => {
-    const lower = txt.toLowerCase();
-    return (
-      lower.includes('không có ảnh') ||
-      lower.includes('chờ ảnh') ||
-      lower.includes('chưa có ảnh') ||
-      lower.includes('không thấy ảnh') ||
-      lower.includes('không nhận được ảnh')
-    );
-  };
+  // Step 1B: For multi-page handwritten PDFs (>= 2 pages), extract per-page question-anchored notes via JSON
+  // while STILL keeping all real submissionImages attached in Step 2!
+  let multiPageNotesText = '';
+  if (submissionImages.length > 1) {
+    const pageNotes: string[] = [];
+    const shortQuestionContext = referenceText.length > 3500
+      ? referenceText.slice(0, 3500)
+      : referenceText;
 
-  if (submissionImages.length > 0) {
-    const pageTranscripts: string[] = [];
     for (let i = 0; i < submissionImages.length; i++) {
       const pageNum = i + 1;
-      const isFirstPage = i === 0;
-
-      const ocrPrompt = isFirstPage
-        ? `Hãy đọc ảnh Trang 1 của bài thi "${submissionFile.name}".
-1. Ghi lại thông tin thí sinh nhìn thấy trên trang này (Họ tên, MSSV, Lớp, Mã đề; nếu không đọc được ghi "Không đọc được", tuyệt đối không bịa tên).
-2. CHÉP NGUYÊN VĂN toàn bộ lời giải viết tay của thí sinh trên Trang 1 theo từng câu / ý (Câu 1.a, Câu 1.b...), giữ nguyên công thức, thay số và kết quả cuối cùng.`
-        : `Hãy đọc ảnh Trang ${pageNum} của bài thi "${submissionFile.name}".
-1. Nếu có ghi tên/mã thí sinh mới ở đầu trang thì ghi ra; nếu là trang tiếp theo của cùng thí sinh ghi "[Trang tiếp theo]".
-2. CHÉP NGUYÊN VĂN toàn bộ lời giải viết tay trên Trang ${pageNum} theo từng câu / ý (Câu 1.b, 1.c, 1.d, Câu 2.a, 2.b...). Giữ nguyên công thức, thay số và đáp số cuối cùng của thí sinh.`;
-
       try {
-        const ocrData = await callOllamaApi(
+        const pageData = await callOllamaApi(
           ollamaConfig,
           '/api/chat',
           {
             model: ollamaConfig.model,
             messages: [
               {
-                role: 'system',
-                content: 'Bạn là máy đọc chữ viết tay & OCR bài thi chuẩn xác tuyệt đối. Chỉ chép lại đúng những gì nhìn thấy trên ảnh, không chấm điểm và tuyệt đối không bịa thông tin.',
-              },
-              {
                 role: 'user',
-                content: ocrPrompt,
+                content: `Đây là ẢNH TRANG ${pageNum}/${submissionImages.length} của bài làm "${submissionFile.name}".
+${shortQuestionContext ? `THAM KHẢO ĐỀ BÀI & ĐÁP ÁN:\n${shortQuestionContext}\n` : ''}
+Hãy quan sát kỹ chữ viết tay, công thức toán lý, phép thay số và hình vẽ trên ảnh Trang ${pageNum} này rồi trả về DUY NHẤT JSON:
+{
+  "examCodeOnPage": "Mã đề nếu thấy viết trên trang này (hoặc \"\")",
+  "solvedQuestions": [
+    {
+      "question": "Tên câu/ý thấy trên trang (vd: Câu 1.a, Câu 1.b, Câu 2.a...)",
+      "workSummary": "Tóm tắt công thức và bước giải thí sinh viết trên trang này",
+      "finalAnswer": "Kết quả/đáp số cuối cùng thí sinh ghi (kèm đơn vị)"
+    }
+  ]
+}`,
                 images: [submissionImages[i]],
               },
             ],
             stream: false,
+            format: 'json',
             options: {
               temperature: 0.0,
               seed: 42,
-              num_ctx: 8192,
+              num_ctx: 6144,
             },
           },
           false
         );
-        const pageOcrText = (ocrData?.message?.content || ocrData?.response || '')
-          .replace(/<think>[\s\S]*?<\/think>/gi, '')
-          .trim();
-        if (pageOcrText && !looksLikeMissingImageReply(pageOcrText)) {
-          pageTranscripts.push(`=== NỘI DUNG TRANG ${pageNum} ===\n${pageOcrText}`);
+        const pageRaw = pageData?.message?.content || pageData?.response || '';
+        if (pageRaw) {
+          const parsedPage = parseJsonWithLatexFix(pageRaw);
+          if (!headerInfo.examCode && !isBannedOrEmptyMeta(parsedPage?.examCodeOnPage)) {
+            headerInfo.examCode = String(parsedPage.examCodeOnPage).trim();
+          }
+          const items = Array.isArray(parsedPage?.solvedQuestions) ? parsedPage.solvedQuestions : [];
+          if (items.length > 0) {
+            const lines = items
+              .filter((it: any) => it && (it.question || it.workSummary || it.finalAnswer))
+              .map((it: any) => `- ${it.question || 'Câu'}: ${it.workSummary || ''} | KQ cuối: ${it.finalAnswer || ''}`);
+            if (lines.length > 0) {
+              pageNotes.push(`[TRANG ${pageNum}]:\n${lines.join('\n')}`);
+            }
+          }
         }
-      } catch (ocrErr: any) {
-        const errMsg = ocrErr?.message || '';
+      } catch (pageErr: any) {
+        const errMsg = pageErr?.message || '';
         if (isVisionUnsupportedError(errMsg) && submissionHasText) {
           console.warn(`Model ${ollamaConfig.model} không hỗ trợ ảnh, dùng văn bản PDF trích xuất để chấm.`);
           break;
         }
-        throw ocrErr;
+        console.warn(`Page ${pageNum} extraction notice:`, pageErr);
       }
     }
 
-    const totalOcrChars = pageTranscripts.join('').trim().length;
-    if (pageTranscripts.length > 0 && totalOcrChars >= 40) {
-      transcribedPagesText = `\n[THÔNG TIN PHÁCH TIÊU ĐỀ ĐÃ XOAY NGANG TỪ TRANG 1]:\n${headerOcrText || '(Xem trong Nội dung Trang 1 bên dưới)'}\n\n[BÀI LÀM VIẾT TAY ĐÃ ĐỌC TRỰC TIẾP TỪ ${pageTranscripts.length}/${submissionImages.length} TRANG ẢNH CỦA BÀI THI "${submissionFile.name}"]:\n${pageTranscripts.join('\n\n')}\n`;
+    if (pageNotes.length > 0) {
+      multiPageNotesText = `\n[TỔNG HỢP LỜI GIẢI ĐỌC TỪ TỪNG TRANG ẢNH CỦA BÀI THI "${submissionFile.name}"]:\n${pageNotes.join('\n\n')}\n`;
     }
   }
 
@@ -568,21 +598,25 @@ TUYỆT ĐỐI KHÔNG tự bịa tên (cấm bịa NGUYEN THI HOA, Nguyễn Minh
     fastFinalResultGrading: fastRule,
   });
 
-  const combinedSubmissionSection = transcribedPagesText
-    ? `${transcribedPagesText}${submissionHasText ? `\n[VĂN BẢN PHỤ TRÍCH TỪ FILE NỘP]:\n${subRes.textBlock}\n` : ''}`
-    : subRes.textBlock;
+  const headerHintBlock = (headerInfo.studentName || headerInfo.studentId || headerInfo.className || headerInfo.examCode)
+    ? `\n[THÔNG TIN THÍ SINH ĐỌC ĐƯỢC TỪ PHÁCH XOAY NGANG TRANG 1]:
+- Họ và tên: ${headerInfo.studentName || '(xem thêm trên ảnh trang 1)'}
+- MSSV / SBD: ${headerInfo.studentId || 'Không có'}
+- Lớp / Khóa: ${headerInfo.className || '(xem thêm trên ảnh trang 1)'}
+- Mã đề thi: ${headerInfo.examCode || '(xem thêm trên ảnh trang 1)'}\n`
+    : '';
 
-  const userPrompt = `${referenceText}\n${combinedSubmissionSection}\n${userGradingRequirements}\n
-LƯU Ý ĐẶC BIỆT KHI TỔNG HỢP KẾT QUẢ:
-- Lấy ĐÚNG Họ và tên thí sinh, MSSV, Lớp, Mã đề từ phần [THÔNG TIN PHÁCH TIÊU ĐỀ ĐÃ XOAY NGANG] và [NỘI DUNG TRANG 1] ở trên (nếu không đọc được thì ghi "Không rõ (không đọc được trên ảnh)", TUYỆT ĐỐI KHÔNG tự bịa tên khác).
-- Đối chiếu ĐẦY ĐỦ tất cả các trang (Trang 1 đến Trang ${submissionImages.length || 1}) để không bỏ sót bất kỳ câu/ý nào thí sinh đã làm ở các trang sau.
-- Trong chuỗi JSON, nếu viết công thức LaTeX thì phải escape dấu gạch chéo ngược thành hai dấu (ví dụ: "\\\\text{x}", "\\\\frac{a}{b}").
+  const userPrompt = `${referenceText}\n${subRes.textBlock}${headerHintBlock}${multiPageNotesText}\n${userGradingRequirements}\n
+LƯU Ý ĐẶC BIỆT:
+- Quan sát trực tiếp các ảnh bài làm đính kèm (tổng ${submissionImages.length} trang) kết hợp với thông tin phách & tóm tắt từng trang ở trên để chấm ĐẦY ĐỦ tất cả các câu thí sinh đã làm ở mọi trang.
+- Không tự bịa tên thí sinh nếu thực sự không đọc được trên ảnh.
+- Nếu viết công thức LaTeX trong chuỗi JSON thì escape dấu gạch chéo ngược thành hai dấu (vd: "\\\\text{x}", "\\\\frac{a}{b}").
 
 BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn bản ngoài JSON):
 {
   "students": [
     {
-      "studentName": "Họ và tên thí sinh trích xuất từ bài thi (hoặc 'Không rõ (không đọc được trên ảnh)' nếu không thấy)",
+      "studentName": "Họ và tên thí sinh đọc trên bài thi (hoặc 'Không rõ (không đọc được trên ảnh)' nếu không thấy)",
       "studentId": "MSSV hoặc SBD nếu có (hoặc 'Không có')",
       "className": "Lớp nếu có (hoặc 'Không có')",
       "examCode": "Mã đề nếu có (hoặc 'Không có')",
@@ -594,16 +628,15 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
   ]
 }`;
 
-  const step2Images = transcribedPagesText
-    ? referenceImages
-    : (referenceImages.length > 0 || submissionImages.length > 0 ? [...referenceImages, ...submissionImages] : []);
+  // ALWAYS keep submissionImages attached to the grading call so Ollama directly sees every exam page
+  const finalImages = [...referenceImages, ...submissionImages];
 
   const messages: any[] = [
     { role: 'system', content: GRADING_SYSTEM_INSTRUCTION },
     {
       role: 'user',
       content: userPrompt,
-      ...(step2Images.length > 0 ? { images: step2Images } : {}),
+      ...(finalImages.length > 0 ? { images: finalImages } : {}),
     },
   ];
 
@@ -615,7 +648,7 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
     options: {
       temperature: 0.0,
       seed: 42,
-      num_ctx: 16384,
+      num_ctx: 8192,
     },
   };
 
@@ -623,7 +656,7 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
     ollamaConfig,
     '/api/chat',
     payload,
-    Boolean(transcribedPagesText) || submissionHasText
+    submissionHasText
   );
 
   const rawContent = data?.message?.content || data?.response || '';
@@ -646,6 +679,35 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
           scoreText: parsed?.scoreText || '',
           feedback: parsed?.feedback || rawContent,
         }];
+
+    // Backfill verified rotated phách metadata if the final JSON missed it
+    if (studentsList.length === 1) {
+      const st = studentsList[0];
+      if (headerInfo.studentName && isBannedOrEmptyMeta(st.studentName)) {
+        st.studentName = headerInfo.studentName;
+        if (typeof st.feedback === 'string') {
+          st.feedback = st.feedback.replace(/(-\s*\*\*Họ và tên thí sinh:\*\*\s*).*(?=\n|$)/i, `$1${headerInfo.studentName}`);
+        }
+      }
+      if (headerInfo.studentId && isBannedOrEmptyMeta(st.studentId)) {
+        st.studentId = headerInfo.studentId;
+        if (typeof st.feedback === 'string') {
+          st.feedback = st.feedback.replace(/(-\s*\*\*Mã số sinh viên.*?:\*\*\s*).*(?=\n|$)/i, `$1${headerInfo.studentId}`);
+        }
+      }
+      if (headerInfo.className && isBannedOrEmptyMeta(st.className)) {
+        st.className = headerInfo.className;
+        if (typeof st.feedback === 'string') {
+          st.feedback = st.feedback.replace(/(-\s*\*\*Lớp \/ Khóa:\*\*\s*).*(?=\n|$)/i, `$1${headerInfo.className}`);
+        }
+      }
+      if (headerInfo.examCode && isBannedOrEmptyMeta(st.examCode)) {
+        st.examCode = headerInfo.examCode;
+        if (typeof st.feedback === 'string') {
+          st.feedback = st.feedback.replace(/(-\s*\*\*Mã đề thi:\*\*\s*).*(?=\n|$)/i, `$1${headerInfo.examCode}`);
+        }
+      }
+    }
 
     // Programmatically compute exact sum from table & synchronize GPA4 / Letter / Rank (identical to Gemini)
     synchronizeStudentScores(studentsList);
