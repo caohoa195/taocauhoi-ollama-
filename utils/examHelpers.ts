@@ -723,6 +723,133 @@ export function extractDeterministicRubricFromText(rawText?: string): string {
   return valid.map((it) => `- ${it.question}: Thang điểm tối đa ${it.maxScore}`).join('\n');
 }
 
+export function extractAttemptedQuestionsFromTranscript(
+  transcript: string,
+  rubricItems: Array<{ question: string; maxScore: number }>
+): { attemptedKeys: Set<string>; lockedUnattemptedQuestions: string[] } {
+  const attemptedKeys = new Set<string>();
+  if (!transcript || !transcript.trim() || !Array.isArray(rubricItems) || rubricItems.length === 0) {
+    return { attemptedKeys, lockedUnattemptedQuestions: [] };
+  }
+
+  const rubricKeySet = new Set(rubricItems.map((it) => compactQuestionKey(it.question)).filter(Boolean));
+  const lines = transcript.split(/\r?\n/);
+  let currentParentNum = '';
+  let activeKey = '';
+  const keyEvidenceMap = new Map<string, string[]>();
+
+  const pushEvidence = (k: string, text: string) => {
+    if (!k) return;
+    const prev = keyEvidenceMap.get(k) || [];
+    prev.push(text);
+    keyEvidenceMap.set(k, prev);
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.replace(/\*\*/g, '').trim();
+    if (!line) continue;
+
+    // Skip negative/absent summary lines so they don't count as attempted
+    if (/^(?:[-*]?\s*)?(?:(?:các\s+)?câu\s*(?:không làm|bỏ trống|chưa làm)|không có trên trang|chưa thấy)/i.test(line)) {
+      continue;
+    }
+
+    // Explicit positive checklist line e.g. "CÁC CÂU CÓ BÀI LÀM: Câu 1.a, Câu 1.b" or "Câu 1.a, b, c"
+    const listMatch = line.match(/^(?:[-*]?\s*)?(?:các\s+câu\s+(?:có\s+bài\s+làm|đã\s+làm)|câu\s+có\s+trên\s+trang)\s*:\s*(.+)$/i);
+    if (listMatch) {
+      const listVal = listMatch[1].trim();
+      const savedParentNum = currentParentNum;
+      let listParentNum = currentParentNum;
+      if (!/^(?:không có|không|trống|none)/i.test(listVal)) {
+        const tokens = listVal.split(/[,;]/);
+        for (const rawTok of tokens) {
+          const tok = rawTok.trim();
+          const ck = compactQuestionKey(tok);
+          if (ck && rubricKeySet.has(ck)) {
+            attemptedKeys.add(ck);
+            const mNum = ck.match(/^(\d+)/);
+            if (mNum) listParentNum = mNum[1];
+          } else {
+            const groupedParent = tok.match(/(?:câu|bài)\s*(\d+)\s*(?:\(|:|\.)?\s*([a-d])$/i);
+            if (groupedParent) {
+              listParentNum = groupedParent[1];
+              const gKey = `${listParentNum}${groupedParent[2].toLowerCase()}`;
+              if (rubricKeySet.has(gKey)) attemptedKeys.add(gKey);
+            } else if (/^[a-d]$/i.test(ck) && listParentNum) {
+              const subKey = `${listParentNum}${ck.toLowerCase()}`;
+              if (rubricKeySet.has(subKey)) attemptedKeys.add(subKey);
+            }
+          }
+        }
+      }
+      currentParentNum = savedParentNum;
+      continue;
+    }
+
+    // Explicit full question+subquestion header e.g. "Câu 1.a", "Câu 1a)", "Bài 2.b", "2a/"
+    const fullMatch = line.match(/^(?:[-*#>\s]*)?(?:câu|bài)\s*(\d+)\s*[.,:：\-]?\s*([a-d])(?:\s*[.):/\-]|$|\s)/i)
+      || line.match(/^(?:[-*#>\s]*)?(\d+)\s*[.,]?\s*([a-d])\s*[.):/]/i);
+    if (fullMatch) {
+      currentParentNum = fullMatch[1];
+      activeKey = `${fullMatch[1]}${fullMatch[2].toLowerCase()}`;
+      const rest = line.slice(fullMatch[0].length).trim();
+      pushEvidence(activeKey, rest);
+      continue;
+    }
+
+    // Parent question header e.g. "Câu 1", "Câu 2:"
+    const parentMatch = line.match(/^(?:[-*#>\s]*)?(?:câu|bài)\s*(\d+)(?:\s*[.):/\-]|$|\s)/i);
+    if (parentMatch) {
+      currentParentNum = parentMatch[1];
+      const rest = line.slice(parentMatch[0].length).trim();
+      // Check if sub-letter follows immediately e.g. "Câu 1: a) ..."
+      const inlineSub = rest.match(/^(?:ý\s*)?([a-d])\s*[.):/]\s*(.*)$/i);
+      if (inlineSub) {
+        activeKey = `${currentParentNum}${inlineSub[1].toLowerCase()}`;
+        pushEvidence(activeKey, inlineSub[2] || '');
+      } else {
+        activeKey = currentParentNum;
+        if (rest) pushEvidence(activeKey, rest);
+      }
+      continue;
+    }
+
+    // Standalone sub-part header e.g. "a/", "b)", "c.", "ý d:" under currentParentNum
+    const subMatch = line.match(/^(?:[-*#>\s]*)?(?:ý\s*)?([a-d])\s*[.):/]\s*(.*)$/i);
+    if (subMatch && currentParentNum) {
+      activeKey = `${currentParentNum}${subMatch[1].toLowerCase()}`;
+      pushEvidence(activeKey, subMatch[2] || '');
+      continue;
+    }
+
+    if (activeKey) {
+      pushEvidence(activeKey, line);
+    }
+  }
+
+  for (const [k, evLines] of keyEvidenceMap.entries()) {
+    const combined = evLines.join(' ').trim();
+    const isExplicitlyEmpty =
+      combined.length === 0 ||
+      /^(?:bỏ trống|không làm|chưa làm|trống|không có bài làm|chỉ ghi tiêu đề[^.]*bỏ trống)[.\s]*$/i.test(combined);
+    if (!isExplicitlyEmpty && rubricKeySet.has(k)) {
+      attemptedKeys.add(k);
+    }
+  }
+
+  // Anti-wipeout guard: only lock unattempted questions when transcript is substantial (>= 150 chars),
+  // at least 2 rubric items were positively detected, and at least 1 remains unlocked.
+  const matchedRubricCount = rubricItems.filter((it) => attemptedKeys.has(compactQuestionKey(it.question))).length;
+  const lockedUnattemptedQuestions =
+    transcript.trim().length >= 150 && matchedRubricCount >= 2 && matchedRubricCount < rubricItems.length
+      ? rubricItems
+          .map((it) => it.question)
+          .filter((lbl) => !attemptedKeys.has(compactQuestionKey(lbl)))
+      : [];
+
+  return { attemptedKeys, lockedUnattemptedQuestions };
+}
+
 export function enforceMasterRubricOnRows(
   rawRows: StructuredQuestionGradeRow[],
   masterRubric?: string,
@@ -754,7 +881,8 @@ export function enforceMasterRubricOnRows(
       isHallucinated ||
       /không làm|bỏ trống|chưa làm/i.test(finalEval) ||
       /^bỏ trống$/i.test(method) ||
-      /^(?:bỏ trống|không làm|chưa làm|không thấy|không có bài|không ghi|không thực hiện)$/i.test(studentAns);
+      /^(?:bỏ trống|không làm|chưa làm|không thấy|không có bài|không ghi|không thực hiện)$/i.test(studentAns) ||
+      /^(?:thí sinh )?(?:không làm|bỏ trống|chưa làm|không thấy bài làm|chưa có bài làm)/i.test(comment);
 
     if (isBlank) {
       earnedScore = 0;

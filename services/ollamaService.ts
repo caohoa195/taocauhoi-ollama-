@@ -3,7 +3,7 @@ import { extractFileContent, extractPdfForOllama, extractPortraitPhachImageCrop 
 import {
   buildExamMetaAndPrompt,
   buildGradingUserPrompt,
-  compactQuestionKey,
+  extractAttemptedQuestionsFromTranscript,
   extractDeterministicRubricFromText,
   formatExamFromVariants,
   formatGradingFeedbackFromStructured,
@@ -132,33 +132,6 @@ const OLLAMA_GRADING_SCHEMA = {
         },
       },
     },
-  },
-};
-
-const OLLAMA_PAGE_OCR_SCHEMA = {
-  type: 'object',
-  required: ['questionsFound', 'pageSummary'],
-  properties: {
-    studentName: { type: 'string' },
-    studentId: { type: 'string' },
-    className: { type: 'string' },
-    examCode: { type: 'string' },
-    questionsFound: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['question', 'hasRealSolution', 'writtenWork', 'finalAnswer', 'diagramDescription'],
-        properties: {
-          question: { type: 'string' },
-          hasRealSolution: { type: 'boolean' },
-          writtenWork: { type: 'string' },
-          finalAnswer: { type: 'string' },
-          diagramDescription: { type: 'string' },
-        },
-      },
-    },
-    lastContinuedQuestion: { type: 'string' },
-    pageSummary: { type: 'string' },
   },
 };
 
@@ -611,13 +584,89 @@ const ensureMasterRubricForOllama = async (
   return '';
 };
 
-// Stage 1: Blind Page-by-Page Transcription (NO Answer Key in context so local VLMs cannot copy answers into blank questions)
+// Dedicated single-image reader for the upright cropped Phách header (Họ tên, Lớp, SBD, Mã đề)
+const readPhachMetadataOllama = async (
+  ollamaConfig: OllamaConfig,
+  phachImages: string[]
+): Promise<{
+  studentName: string;
+  studentId: string;
+  className: string;
+  examCode: string;
+}> => {
+  const result = { studentName: '', studentId: '', className: '', examCode: '' };
+  if (!phachImages || phachImages.length === 0) return result;
+
+  const payload = {
+    model: ollamaConfig.model,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Bạn là chuyên gia đọc chữ viết tay tiếng Việt trên phần PHÁCH bài thi. Chỉ đọc chính xác thông tin viết tay, trả về JSON thuần gồm 4 khóa: studentName, studentId, className, examCode.',
+      },
+      {
+        role: 'user',
+        content:
+          'Ảnh này là phần PHÁCH bên phải Trang 1 đã xoay thẳng đứng. Hãy đọc chữ viết tay tại các mục:\n' +
+          '- "Họ và tên:" -> studentName\n' +
+          '- "Số báo danh" / "MSSV" -> studentId\n' +
+          '- "Lớp:" -> className\n' +
+          '- "Mã đề" / "Đề" (nếu có) -> examCode\n' +
+          'Trả về JSON: {"studentName": "...", "studentId": "...", "className": "...", "examCode": "..."} (mục nào trống thì ghi "").',
+        images: [phachImages[0]],
+      },
+    ],
+    stream: false,
+    think: false,
+    keep_alive: '10m',
+    format: 'json',
+    options: {
+      temperature: 0.0,
+      seed: 42,
+      top_k: 1,
+      repeat_penalty: 1.0,
+      num_ctx: 4096,
+      num_predict: 256,
+    },
+  };
+
+  try {
+    const data = await callOllamaApi(ollamaConfig, '/api/chat', payload, false);
+    const raw = data?.message?.content || data?.response || '';
+    if (!raw) return result;
+
+    try {
+      const parsed = stripThinkingAndParseJson(raw);
+      result.studentName = sanitizeStudentField(parsed?.studentName, 'name');
+      result.studentId = sanitizeStudentField(parsed?.studentId, 'meta');
+      result.className = sanitizeStudentField(parsed?.className, 'meta');
+      result.examCode = sanitizeStudentField(parsed?.examCode, 'meta');
+    } catch {
+      const mName = raw.match(/họ\s*(?:và\s*)?tên\s*[:：\-]\s*([^\n,{}"]+)/i);
+      const mClass = raw.match(/lớp\s*[:：\-]\s*([^\n,{}"]+)/i);
+      const mId = raw.match(/(?:sbd|mssv|số báo danh)\s*[:：\-]\s*([^\n,{}"]+)/i);
+      if (mName) result.studentName = sanitizeStudentField(mName[1], 'name');
+      if (mClass) result.className = sanitizeStudentField(mClass[1], 'meta');
+      if (mId) result.studentId = sanitizeStudentField(mId[1], 'meta');
+    }
+  } catch (err: any) {
+    const msg = err?.message || '';
+    if (msg.includes('Không thể kết nối đến Ollama') || msg.includes('hiện không hỗ trợ đọc ảnh')) {
+      throw err;
+    }
+    console.warn('Không đọc được ảnh Phách riêng:', msg);
+  }
+
+  return result;
+};
+
+// Stage 1: Blind Page-by-Page Plain-Text Transcription (NO Answer Key in context, NO rigid array schema trap)
 const transcribeSubmissionBlindOllama = async (
   ollamaConfig: OllamaConfig,
   pageImages: string[],
   phachImages: string[],
-  rubricQuestionLabels: string[],
-  submissionHasText: boolean
+  rubricItems: Array<{ question: string; maxScore: number }>
 ): Promise<{
   detectedName: string;
   detectedId: string;
@@ -627,40 +676,46 @@ const transcribeSubmissionBlindOllama = async (
   attemptedKeys: Set<string>;
   lockedUnattemptedQuestions: string[];
 }> => {
-  let detectedName = '';
-  let detectedId = '';
-  let detectedClass = '';
-  let detectedExamCode = '';
-  let lastContinuedQuestion = '';
-  const pageSections: string[] = [];
-  const attemptedKeys = new Set<string>();
+  const phachMeta = await readPhachMetadataOllama(ollamaConfig, phachImages);
+  let detectedName = phachMeta.studentName;
+  let detectedId = phachMeta.studentId;
+  let detectedClass = phachMeta.className;
+  let detectedExamCode = phachMeta.examCode;
 
+  const rubricLabels = rubricItems.map((it) => it.question);
   const questionLabelsHint =
-    rubricQuestionLabels.length > 0
-      ? `Danh sách ký hiệu câu/ý cần tách riêng từng mục (nếu có xuất hiện trên trang): ${rubricQuestionLabels.join(', ')}. KHÔNG gộp nhiều ý (vd: KHÔNG ghi chung "Câu 1" mà phải tách thành "Câu 1.a", "Câu 1.b"...).`
-      : 'Tách riêng từng câu/ý xuất hiện trên trang (vd: Câu 1.a, Câu 1.b, Câu 2.a...), không gộp chung.';
+    rubricLabels.length > 0
+      ? `Danh sách ký hiệu câu của đề thi: ${rubricLabels.join(', ')}.`
+      : 'Ghi rõ ký hiệu câu hỏi (vd: Câu 1.a, Câu 1.b, Câu 2.a...).';
+
+  const pageSections: string[] = [];
+  let prevPageTailHint = '';
 
   for (let i = 0; i < pageImages.length; i++) {
     const isPage1 = i === 0;
-    const imgsForPage = isPage1 && phachImages.length > 0
-      ? [...phachImages, pageImages[i]]
-      : [pageImages[i]];
-
     const pagePrompt = isPage1
-      ? `${phachImages.length > 0 ? 'Ảnh số 1 là ẢNH PHÁCH ĐÃ XOAY THẲNG ĐỨNG (ghi Họ tên, Lớp, SBD). Ảnh số 2 là TRANG 1 bài làm.\n' : 'Đây là TRANG 1 bài làm của thí sinh.\n'}Nhiệm vụ:
-1. Đọc chính xác thông tin viết tay trên Phách/Trang 1: Họ và tên ("studentName"), SBD/MSSV ("studentId"), Lớp ("className"), Mã đề ("examCode"). Nếu không có để "".
-2. Đọc nguyên văn TỪNG CÂU / Ý mà thí sinh THỰC SỰ VIẾT hoặc VẼ trên trang này. ${questionLabelsHint}
-QUY TẮC NGHIÊM NGẶT:
-- CHỈ chép những gì nhìn thấy trên ảnh trang này. TUYỆT ĐỐI KHÔNG tự giải thêm, KHÔNG chép câu không có mặt trên trang này!
-- Nếu thí sinh chỉ ghi tiêu đề câu (vd "Câu 2 a/") mà chưa giải và chưa vẽ hình gì ở bên dưới -> đặt hasRealSolution: false.
-- Nếu có HÌNH VẼ (mặt phẳng nghiêng, ròng rọc, các vectơ lực P, N, T, Fms...), mô tả chi tiết hình và các ký hiệu lực trong "diagramDescription".`
-      : `Đây là TRANG ${i + 1} bài làm của thí sinh.${lastContinuedQuestion ? ` (Lưu ý: Trang trước đang dừng ở câu "${lastContinuedQuestion}" — nếu đầu trang này có hình vẽ hoặc lời giải nối tiếp chưa ghi tên câu thì gán vào "${lastContinuedQuestion}").` : ''}
-${questionLabelsHint}
-QUY TẮC NGHIÊM NGẶT:
-- CHỈ chép nguyên văn những câu/ý thực sự có bài làm hoặc hình vẽ trên TRANG ${i + 1} này.
-- TUYỆT ĐỐI KHÔNG tự giải bài hay bịa thêm câu không viết trên giấy!
-- Nếu trang này không có bài làm nào mới hoặc bỏ trống hoàn toàn, trả về mảng "questionsFound": [].
-- Nếu có HÌNH VẼ (vectơ lực, sơ đồ...), mô tả chi tiết hình và ký hiệu trong "diagramDescription".`;
+      ? `Đây là TRANG 1 bài làm viết tay của thí sinh (KHÔNG có đáp án). ${questionLabelsHint}
+Hãy đọc và chép lại TRUNG THỰC 100% những gì thực sự viết hoặc vẽ trên TRANG 1 này:
+1. Nếu thấy Họ và tên, Lớp, SBD hoặc chữ "Đề ..." (vd: "Đề 2") cạnh mục BÀI LÀM -> ghi ngay ở đầu:
+   THÔNG TIN: Họ tên: ... | Lớp: ... | SBD: ... | Mã đề: ...
+2. Với MỖI câu/ý THỰC SỰ CÓ LỜI GIẢI trên trang này, viết theo đúng định dạng từng mục:
+   Câu X.y:
+   - Bài làm: (chép nguyên văn công thức, phép tính, kết quả cuối cùng thí sinh viết)
+   - Hình vẽ (nếu có): (mô tả các vật, góc nghiêng, lực P, N, T, Fms...)
+3. QUY TẮC NGHIÊM NGẶT:
+   - CHỈ chép những câu thực sự xuất hiện trên TRANG 1 này! TUYỆT ĐỐI KHÔNG tự giải thêm hoặc bịa thêm câu chưa xuất hiện trên ảnh!
+   - Nếu thí sinh chỉ ghi tiêu đề câu ở cuối trang (vd "a/") mà chưa có bài giải bên dưới -> ghi rõ "Chỉ ghi tiêu đề, chưa giải trên trang này".
+   - Cuối cùng ghi 1 dòng: CÁC CÂU CÓ BÀI LÀM: (liệt kê đúng các ký hiệu câu có lời giải trên trang này, cách nhau bằng dấu phẩy).`
+      : `Đây là TRANG ${i + 1} bài làm viết tay của thí sinh (KHÔNG có đáp án). ${questionLabelsHint}${prevPageTailHint ? `\n(Lưu ý: Cuối trang trước đang dừng ở mục "${prevPageTailHint}". Nếu đầu trang này có phần tính tiếp hoặc hình vẽ tiếp nối chưa ghi tên câu thì gắn vào mục đó).` : ''}
+Hãy đọc và chép lại TRUNG THỰC 100% những gì thực sự viết hoặc vẽ trên TRANG ${i + 1} này:
+1. Với MỖI câu/ý hoặc hình vẽ THỰC SỰ CÓ trên trang này, viết theo định dạng:
+   Câu X.y:
+   - Bài làm: (chép nguyên văn công thức, phép biến đổi, kết quả cuối cùng thí sinh viết)
+   - Hình vẽ (nếu có): (mô tả chi tiết hình vẽ: vật, mặt phẳng nghiêng, ròng rọc, các vectơ lực P, N, T, Fms...)
+2. QUY TẮC NGHIÊM NGẶT:
+   - CHỈ chép những gì có thật trên TRANG ${i + 1}! TUYỆT ĐỐI KHÔNG tự giải bài hay bịa thêm câu không viết trên giấy!
+   - Nếu trang này trống hoặc không có câu nào mới -> ghi "CÁC CÂU CÓ BÀI LÀM: Không có".
+   - Cuối cùng ghi 1 dòng: CÁC CÂU CÓ BÀI LÀM: (liệt kê đúng các ký hiệu câu có lời giải/hình vẽ trên trang này, cách nhau bằng dấu phẩy).`;
 
     const ocrPayload = {
       model: ollamaConfig.model,
@@ -668,18 +723,17 @@ QUY TẮC NGHIÊM NGẶT:
         {
           role: 'system',
           content:
-            'Bạn là máy đọc chữ viết tay & hình vẽ bài thi (OCR trung thực 100%). Chỉ chép lại nguyên văn nội dung có thật trên trang ảnh được giao, không tự ý giải bài hoặc thêm câu không tồn tại. Trả về đúng JSON schema.',
+            'Bạn là máy đọc chữ viết tay & hình vẽ bài thi trung thực 100%. Chỉ chép lại nguyên văn nội dung nhìn thấy trên trang ảnh bài thi, không giải hộ và không thêm câu không có trên giấy.',
         },
         {
           role: 'user',
           content: pagePrompt,
-          images: imgsForPage,
+          images: [pageImages[i]],
         },
       ],
       stream: false,
       think: false,
       keep_alive: '10m',
-      format: OLLAMA_PAGE_OCR_SCHEMA,
       options: {
         temperature: 0.0,
         seed: 42,
@@ -687,57 +741,43 @@ QUY TẮC NGHIÊM NGẶT:
         top_p: 1.0,
         repeat_penalty: 1.0,
         num_ctx: 8192,
-        num_predict: 1536,
+        num_predict: 1400,
       },
     };
 
     try {
-      const data = await callOllamaApi(ollamaConfig, '/api/chat', ocrPayload, submissionHasText);
-      const raw = data?.message?.content || data?.response || '';
+      const data = await callOllamaApi(ollamaConfig, '/api/chat', ocrPayload, false);
+      const raw = String(data?.message?.content || data?.response || '')
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .trim();
+
       if (!raw) continue;
-      const parsed = stripThinkingAndParseJson(raw);
 
       if (isPage1) {
-        detectedName = sanitizeStudentField(parsed?.studentName, 'name') || detectedName;
-        detectedId = sanitizeStudentField(parsed?.studentId, 'meta') || detectedId;
-        detectedClass = sanitizeStudentField(parsed?.className, 'meta') || detectedClass;
-        detectedExamCode = sanitizeStudentField(parsed?.examCode, 'meta') || detectedExamCode;
-      }
-
-      if (parsed?.lastContinuedQuestion) {
-        lastContinuedQuestion = String(parsed.lastContinuedQuestion).trim();
-      }
-
-      const found = Array.isArray(parsed?.questionsFound) ? parsed.questionsFound : [];
-      const pageLines: string[] = [];
-
-      for (const item of found) {
-        const qName = String(item?.question || '').trim();
-        const work = String(item?.writtenWork || '').trim();
-        const finalAns = String(item?.finalAnswer || '').trim();
-        const diag = String(item?.diagramDescription || '').trim();
-        const hasBlankTextOnly = /^(?:bỏ trống|không làm|chưa làm|trống|không có)$/i.test(work) && !diag;
-        const hasMeaningfulContent =
-          Boolean(item?.hasRealSolution) &&
-          !hasBlankTextOnly &&
-          (work.length >= 3 || finalAns.length >= 1 || (diag.length >= 5 && !/không có hình/i.test(diag)));
-
-        if (qName && hasMeaningfulContent) {
-          attemptedKeys.add(compactQuestionKey(qName));
-          lastContinuedQuestion = qName;
-          pageLines.push(
-            `- ${qName}:\n  + Lời giải viết tay: ${work || '(Xem hình vẽ)'}\n  + Kết quả cuối HS viết: ${finalAns || '(Không ghi kết quả riêng)'}${diag && !/không có/i.test(diag) ? `\n  + Mô tả hình vẽ: ${diag}` : ''}`
-          );
-        } else if (qName) {
-          lastContinuedQuestion = qName;
-          pageLines.push(`- ${qName}: (Thí sinh chỉ ghi tên câu, BỎ TRỐNG phần bài làm bên dưới).`);
+        if (!detectedName) {
+          const mName = raw.match(/họ\s*(?:và\s*)?tên\s*[:：]\s*([^|\n]+)/i);
+          if (mName) detectedName = sanitizeStudentField(mName[1], 'name');
+        }
+        if (!detectedClass) {
+          const mCls = raw.match(/lớp\s*[:：]\s*([^|\n]+)/i);
+          if (mCls) detectedClass = sanitizeStudentField(mCls[1], 'meta');
+        }
+        if (!detectedId) {
+          const mId = raw.match(/(?:sbd|mssv|số báo danh)\s*[:：]\s*([^|\n]+)/i);
+          if (mId) detectedId = sanitizeStudentField(mId[1], 'meta');
+        }
+        if (!detectedExamCode) {
+          const mCode = raw.match(/mã\s*đề\s*[:：]\s*([^|\n]+)/i) || raw.match(/BÀI\s*LÀM\s*(Đề\s*\d+)/i);
+          if (mCode) detectedExamCode = sanitizeStudentField(mCode[1], 'meta');
         }
       }
 
-      const summary = String(parsed?.pageSummary || '').trim();
-      pageSections.push(
-        `[TRANG ${i + 1} BÀI LÀM]:\n${pageLines.length > 0 ? pageLines.join('\n') : (summary || '(Không có bài làm bổ sung trên trang này)')}`
-      );
+      const headingMatches = [...raw.matchAll(/(?:Câu|Bài)\s*\d+(?:\s*[.,]?\s*[a-d])?/gi)];
+      if (headingMatches.length > 0) {
+        prevPageTailHint = headingMatches[headingMatches.length - 1][0].trim();
+      }
+
+      pageSections.push(`[TRANG ${i + 1} BÀI LÀM]:\n${raw}`);
     } catch (ocrErr: any) {
       const msg = ocrErr?.message || '';
       if (msg.includes('Không thể kết nối đến Ollama') || msg.includes('hiện không hỗ trợ đọc ảnh')) {
@@ -747,17 +787,18 @@ QUY TẮC NGHIÊM NGẶT:
     }
   }
 
-  const lockedUnattemptedQuestions =
-    attemptedKeys.size > 0 && rubricQuestionLabels.length > 0
-      ? rubricQuestionLabels.filter((lbl) => !attemptedKeys.has(compactQuestionKey(lbl)))
-      : [];
+  const transcriptText = pageSections.join('\n\n');
+  const { attemptedKeys, lockedUnattemptedQuestions } = extractAttemptedQuestionsFromTranscript(
+    transcriptText,
+    rubricItems
+  );
 
   return {
     detectedName,
     detectedId,
     detectedClass,
     detectedExamCode,
-    transcriptText: pageSections.join('\n\n'),
+    transcriptText,
     attemptedKeys,
     lockedUnattemptedQuestions,
   };
@@ -1008,17 +1049,15 @@ export const gradeSingleSubmissionOllama = async (
   });
 
   const rubricItems = parseMasterRubricItems(effectiveMasterRubric);
-  const rubricQuestionLabels = rubricItems.map((it) => it.question);
 
-  // 5. Stage 1: Blind Page-by-Page Transcription for scanned PDFs / image submissions (prevents Answer Key leakage!)
+  // 5. Stage 1: Dedicated Phách reader + Blind Page-by-Page Plain-Text Transcription
   let blindOcrResult: Awaited<ReturnType<typeof transcribeSubmissionBlindOllama>> | null = null;
   if (subRes.pageImages.length > 0 && !submissionHasText) {
     blindOcrResult = await transcribeSubmissionBlindOllama(
       ollamaConfig,
       subRes.pageImages,
       subRes.phachImages,
-      rubricQuestionLabels,
-      submissionHasText
+      rubricItems
     );
   }
 
@@ -1030,15 +1069,16 @@ export const gradeSingleSubmissionOllama = async (
   let submissionSection = '';
   if (usedBlindTranscript && blindOcrResult) {
     submissionSection =
-      `\n=== [BÀI LÀM THÍ SINH — BẢN CHÉP TRUNG THỰC TỪ ẢNH BÀI THI] ===\n` +
+      `\n=== [BÀI LÀM THÍ SINH — BẢN CHÉP TRUNG THỰC ĐỌC ĐỘC LẬP TỪ ẢNH] ===\n` +
       `- Thông tin đọc từ Phách/Trang 1: Họ tên="${blindOcrResult.detectedName || 'Chưa rõ'}", SBD="${blindOcrResult.detectedId || 'Không có'}", Lớp="${blindOcrResult.detectedClass || 'Không có'}", Mã đề="${blindOcrResult.detectedExamCode || 'Không có'}"\n` +
       `${blindOcrResult.transcriptText}\n` +
       (lockedUnattemptedQuestions.length > 0
         ? `\n[DANH SÁCH CÂU THÍ SINH HOÀN TOÀN KHÔNG LÀM TRONG BÀI (BẮT BUỘC CHO 0.0 ĐIỂM)]: ${lockedUnattemptedQuestions.join(', ')}\n`
         : '') +
-      `\n================================================================\n`;
-    // Keep Stage 2 pure text when Blind OCR succeeded (prevents Answer Key / multi-image collapse).
-    // Include reference images ONLY if Exam/AnswerKey themselves were image scans without text.
+      `\n======================================================================\n` +
+      `[GHI CHÚ ẢNH ĐÍNH KÈM]: Các ảnh bài làm gốc (${subRes.pageImages.length} trang) cũng được đính kèm bên dưới để đối chiếu công thức/hình vẽ, NHƯNG TUYỆT ĐỐI không tự bịa lời giải cho các câu không có trong bài làm.\n`;
+    // Always keep pageImages in Stage 2 (Gemini parity!) so a missed OCR line can never wipe out real student work!
+    subRes.pageImages.forEach((b64) => images.push(b64));
     referenceImages.forEach((b64) => images.push(b64));
   } else {
     submissionSection = subRes.textBlock;
@@ -1138,7 +1178,7 @@ LƯU Ý QUAN TRỌNG KHI XUẤT JSON:
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const canDropImgs = usedBlindTranscript ? referenceImages.length === 0 : submissionHasText;
+      const canDropImgs = submissionHasText && referenceImages.length === 0;
       const data = await callOllamaApi(ollamaConfig, '/api/chat', payload, canDropImgs);
       const rawContent = data?.message?.content || data?.response || '';
       if (!rawContent) {

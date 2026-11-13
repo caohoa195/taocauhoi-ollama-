@@ -96,11 +96,12 @@ const reconstructPdfPageText = (items: any[]): string => {
 const renderRightPhachCropUpright = (srcCanvas: HTMLCanvasElement): string | null => {
   try {
     if (typeof document === 'undefined' || srcCanvas.width < 100 || srcCanvas.height < 100) return null;
-    // Standard Vietnamese exam sheets print Phách (Họ tên, Lớp, SBD) vertically along the right ~36% margin, rotated 90° clockwise.
-    // Rotating that right strip -90° (counter-clockwise) restores text upright left-to-right.
-    const sx = Math.floor(srcCanvas.width * 0.62);
-    const sw = srcCanvas.width - sx;
-    const sh = srcCanvas.height;
+    // Standard Vietnamese exam sheets print Phách (Họ tên, Lớp, SBD) vertically along the right ~32% strip, rotated 90° clockwise.
+    // Crop tightly around that strip (avoiding far-left body and extreme edge margins) and rotate -90° counter-clockwise upright.
+    const sx = Math.floor(srcCanvas.width * 0.65);
+    const sw = Math.min(srcCanvas.width - sx, Math.floor(srcCanvas.width * 0.31));
+    const sy = Math.floor(srcCanvas.height * 0.06);
+    const sh = Math.min(srcCanvas.height - sy, Math.floor(srcCanvas.height * 0.88));
     if (sw <= 20 || sh <= 20) return null;
 
     const cropCanvas = document.createElement('canvas');
@@ -113,9 +114,9 @@ const renderRightPhachCropUpright = (srcCanvas: HTMLCanvasElement): string | nul
     cropCtx.fillRect(0, 0, cropCanvas.width, cropCanvas.height);
     cropCtx.translate(0, cropCanvas.height);
     cropCtx.rotate(-Math.PI / 2);
-    cropCtx.drawImage(srcCanvas, sx, 0, sw, sh, 0, 0, sw, sh);
+    cropCtx.drawImage(srcCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
 
-    const dataUrl = cropCanvas.toDataURL('image/jpeg', 0.9);
+    const dataUrl = cropCanvas.toDataURL('image/jpeg', 0.92);
     return dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
   } catch (err) {
     console.warn('Could not create upright phach crop:', err);
@@ -208,8 +209,8 @@ export const extractPdfForOllama = async (
         try {
           const baseViewport = page.getViewport({ scale: 1 });
           const maxDim = Math.max(baseViewport.width, baseViewport.height, 1);
-          // Render Page 1 slightly higher (1500px) to preserve handwritten formulas and Phách header details
-          const targetMax = i === 0 && !onlyRenderIfNoText ? 1500 : 1200;
+          // Render Page 1 at higher resolution (1800px) to preserve handwritten formulas and Phách header details
+          const targetMax = i === 0 && !onlyRenderIfNoText ? 1800 : 1400;
           const scale = Math.min(2.5, Math.max(1.0, targetMax / maxDim));
           const viewport = page.getViewport({ scale });
 
