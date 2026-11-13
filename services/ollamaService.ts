@@ -4,8 +4,10 @@ import {
   buildExamMetaAndPrompt,
   buildGradingUserPrompt,
   formatExamFromVariants,
+  formatGradingFeedbackFromStructured,
   getExamSystemInstruction,
   GRADING_SYSTEM_INSTRUCTION,
+  StructuredGradedStudent,
   synchronizeStudentScores,
 } from "../utils/examHelpers";
 
@@ -15,6 +17,85 @@ export interface OllamaConnectionResult {
   error?: string;
   source?: 'browser' | 'proxy';
 }
+
+const OLLAMA_EXAM_SCHEMA = {
+  type: 'object',
+  required: ['variants'],
+  properties: {
+    variants: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['variantNumber', 'questions', 'answerRows'],
+        properties: {
+          variantNumber: { type: 'integer' },
+          questions: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['questionLabel', 'questionContent'],
+              properties: {
+                sectionTitle: { type: 'string' },
+                questionLabel: { type: 'string' },
+                questionContent: { type: 'string' },
+              },
+            },
+          },
+          answerRows: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['content', 'points'],
+              properties: {
+                content: { type: 'string' },
+                points: { type: 'string' },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+};
+
+const OLLAMA_GRADING_SCHEMA = {
+  type: 'object',
+  required: ['students'],
+  properties: {
+    students: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['studentName', 'questionRows'],
+        properties: {
+          studentName: { type: 'string' },
+          studentId: { type: 'string' },
+          className: { type: 'string' },
+          examCode: { type: 'string' },
+          questionRows: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['question', 'studentAnswer', 'isFinalCorrect', 'gradingMethod', 'maxScore', 'earnedScore', 'comment'],
+              properties: {
+                question: { type: 'string' },
+                requirement: { type: 'string' },
+                studentAnswer: { type: 'string' },
+                isFinalCorrect: { type: 'string' },
+                gradingMethod: { type: 'string' },
+                maxScore: { type: 'number' },
+                earnedScore: { type: 'number' },
+                comment: { type: 'string' },
+              },
+            },
+          },
+          strengths: { type: 'string' },
+          weaknesses: { type: 'string' },
+        },
+      },
+    },
+  },
+};
 
 const normalizeOllamaUrl = (rawUrl?: string): string => {
   let u = (rawUrl || 'http://localhost:11434').trim().replace(/\/+$/, '');
@@ -54,6 +135,20 @@ const isVisionUnsupportedError = (msg: string): boolean => {
     lower.includes('vision is not supported') ||
     lower.includes('image input is not supported') ||
     lower.includes('projector')
+  );
+};
+
+const isSchemaOrThinkUnsupportedError = (msg: string): boolean => {
+  const lower = (msg || '').toLowerCase();
+  if (!lower.includes('ollama lỗi (400)') && !lower.includes('(400)') && !lower.includes('unmarshal')) {
+    return false;
+  }
+  return (
+    lower.includes('format') ||
+    lower.includes('think') ||
+    lower.includes('schema') ||
+    lower.includes('unmarshal') ||
+    lower.includes('unknown field')
   );
 };
 
@@ -107,7 +202,7 @@ export const checkOllamaConnection = async (
   }
 };
 
-// Send request to Ollama (via browser or proxy) with smart text fallback if model lacks vision
+// Send request to Ollama (via browser or proxy) with smart backward-compat & text fallback
 const callOllamaApi = async (
   ollamaConfig: OllamaConfig,
   endpoint: '/api/chat' | '/api/generate',
@@ -172,38 +267,61 @@ const callOllamaApi = async (
     return await proxyRes.json();
   };
 
-  try {
-    return await doSend(body);
-  } catch (err: any) {
-    const errMsg = err?.message || '';
-    const hasImages = Array.isArray(body?.messages) && body.messages.some((m: any) => Array.isArray(m.images) && m.images.length > 0);
-    if (hasImages && isVisionUnsupportedError(errMsg)) {
-      if (canFallbackWithoutImages) {
-        console.warn(`Model ${ollamaConfig.model} không hỗ trợ ảnh, tự động chuyển sang dùng văn bản trích xuất...`);
-        const textOnlyBody = {
-          ...body,
-          messages: body.messages.map((m: any) => {
-            const { images: _ignored, ...rest } = m;
-            return rest;
-          }),
+  const executeWithFallbacks = async (payloadToTry: any, allowCompatDowngrade: boolean): Promise<any> => {
+    try {
+      return await doSend(payloadToTry);
+    } catch (err: any) {
+      const errMsg = err?.message || '';
+
+      // Backward compatibility for older Ollama servers that reject JSON schema `format` or `think: false`
+      const hasObjectFormatOrThink =
+        (payloadToTry?.format && typeof payloadToTry.format === 'object') ||
+        payloadToTry?.think !== undefined;
+      if (allowCompatDowngrade && hasObjectFormatOrThink && isSchemaOrThinkUnsupportedError(errMsg)) {
+        console.warn("Ollama server không hỗ trợ format schema hoặc tham số think, tự động chuyển về format: 'json'...");
+        const { think: _omitThink, ...restPayload } = payloadToTry;
+        const legacyPayload = {
+          ...restPayload,
+          format: 'json',
         };
-        return await doSend(textOnlyBody);
+        return await executeWithFallbacks(legacyPayload, false);
       }
-      throw new Error(
-        `Model Ollama "${ollamaConfig.model}" hiện không hỗ trợ đọc ảnh/PDF scan. Vui lòng chọn model hỗ trợ hình ảnh (như gemma4:e4b, gemma4:12b, qwen3.6:35b-a3b-q4, qwen2.5vl) hoặc tải lên file văn bản/Word.`
-      );
+
+      const hasImages =
+        Array.isArray(payloadToTry?.messages) &&
+        payloadToTry.messages.some((m: any) => Array.isArray(m.images) && m.images.length > 0);
+      if (hasImages && isVisionUnsupportedError(errMsg)) {
+        if (canFallbackWithoutImages) {
+          console.warn(`Model ${ollamaConfig.model} không hỗ trợ ảnh, tự động chuyển sang dùng văn bản trích xuất...`);
+          const textOnlyBody = {
+            ...payloadToTry,
+            messages: payloadToTry.messages.map((m: any) => {
+              const { images: _ignored, ...rest } = m;
+              return rest;
+            }),
+          };
+          return await doSend(textOnlyBody);
+        }
+        throw new Error(
+          `Model Ollama "${ollamaConfig.model}" hiện không hỗ trợ đọc ảnh/PDF scan. Vui lòng chọn model hỗ trợ hình ảnh (như gemma4:e4b, gemma4:12b, qwen3.6:35b-a3b-q4, qwen2.5vl) hoặc tải lên file văn bản/Word.`
+        );
+      }
+      throw err;
     }
-    throw err;
-  }
+  };
+
+  return await executeWithFallbacks(body, true);
 };
 
-// Extract text and/or page images from any file (DOCX, TXT, Image, PDF) so Ollama sees full content like Gemini
+// Extract text and/or page images from any file (DOCX, TXT, Image, PDF) so Ollama sees full content cleanly
 const appendFileForOllama = async (
   file: File,
   roleLabel: string,
   images: string[],
-  maxPdfRenderPages = 6
-): Promise<{ textBlock: string; hasExtractedText: boolean }> => {
+  options: { maxPdfRenderPages?: number; onlyRenderIfNoText?: boolean } = {}
+): Promise<{ textBlock: string; hasExtractedText: boolean; normalizedText: string }> => {
+  const maxPdfRenderPages = options.maxPdfRenderPages ?? 4;
+  const onlyRenderIfNoText = options.onlyRenderIfNoText ?? false;
   const extracted = await extractFileContent(file);
 
   if (extracted.type === 'text' && extracted.text) {
@@ -213,6 +331,7 @@ const appendFileForOllama = async (
     return {
       textBlock: `\n--- [${roleLabel}] File: "${file.name}" ---\n${trimmed}\n`,
       hasExtractedText: trimmed.trim().length > 20,
+      normalizedText: extracted.text.replace(/\s+/g, ' ').trim(),
     };
   }
 
@@ -222,12 +341,13 @@ const appendFileForOllama = async (
     return {
       textBlock: `\n--- [${roleLabel}] Ảnh đính kèm số ${imgIdx}: "${file.name}" ---\n(Hãy đọc kỹ toàn bộ chữ viết tay, công thức, khoanh tròn và nội dung trong Ảnh số ${imgIdx}).\n`,
       hasExtractedText: false,
+      normalizedText: '',
     };
   }
 
   if (extracted.type === 'pdf') {
     try {
-      const pdfData = await extractPdfForOllama(file, maxPdfRenderPages);
+      const pdfData = await extractPdfForOllama(file, maxPdfRenderPages, onlyRenderIfNoText);
       let block = `\n--- [${roleLabel}] Tài liệu PDF (${pdfData.pageCount} trang): "${file.name}" ---\n`;
       if (pdfData.text && pdfData.text.trim().length > 0) {
         const cleanPdfText = pdfData.text.length > 25000
@@ -244,6 +364,7 @@ const appendFileForOllama = async (
       return {
         textBlock: block,
         hasExtractedText: (pdfData.text || '').trim().length > 40,
+        normalizedText: (pdfData.text || '').replace(/\s+/g, ' ').trim(),
       };
     } catch (pdfErr) {
       console.warn(`Không thể phân tích PDF "${file.name}" cho Ollama:`, pdfErr);
@@ -254,12 +375,14 @@ const appendFileForOllama = async (
     return {
       textBlock: `\n--- [${roleLabel}] File: "${file.name}" ---\n${extracted.text}\n`,
       hasExtractedText: extracted.text.trim().length > 20,
+      normalizedText: extracted.text.replace(/\s+/g, ' ').trim(),
     };
   }
 
   return {
     textBlock: `\n[${roleLabel}: "${file.name}"]\n`,
     hasExtractedText: false,
+    normalizedText: '',
   };
 };
 
@@ -273,7 +396,11 @@ export const generateExamContentOllama = async (
 
   if (config.sourceFiles && config.sourceFiles.length > 0) {
     for (const file of config.sourceFiles) {
-      const res = await appendFileForOllama(file, 'TÀI LIỆU NGUỒN', images, 5);
+      // Source materials are text/reference docs: only render images if scanned PDF lacks text
+      const res = await appendFileForOllama(file, 'TÀI LIỆU NGUỒN', images, {
+        maxPdfRenderPages: 4,
+        onlyRenderIfNoText: true,
+      });
       attachedText += res.textBlock;
       if (!res.hasExtractedText) allFilesHaveText = false;
     }
@@ -320,61 +447,87 @@ Lưu ý: Tạo ĐÚNG ${totalVariants} phần tử trong mảng "variants" (vari
     model: ollamaConfig.model,
     messages,
     stream: false,
-    format: 'json',
+    think: false,
+    keep_alive: '10m',
+    format: OLLAMA_EXAM_SCHEMA,
     options: {
       temperature: 0.1,
+      seed: 42,
+      top_k: 1,
+      repeat_penalty: 1.0,
       num_ctx: 16384,
+      num_predict: 4096,
     },
   };
 
-  const data = await callOllamaApi(ollamaConfig, '/api/chat', payload, allFilesHaveText);
+  let lastRawContent = '';
+  let lastError: any = null;
 
-  const rawContent = data?.message?.content || data?.response || '';
-  if (!rawContent) {
-    throw new Error('Ollama không trả về nội dung hợp lệ.');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const data = await callOllamaApi(ollamaConfig, '/api/chat', payload, allFilesHaveText);
+      const rawContent = data?.message?.content || data?.response || '';
+      if (!rawContent) {
+        throw new Error('Ollama không trả về nội dung hợp lệ.');
+      }
+      lastRawContent = rawContent;
+
+      const parsed = stripThinkingAndParseJson(rawContent);
+      if (Array.isArray(parsed?.variants) && parsed.variants.length > 0) {
+        return formatExamFromVariants(parsed.variants, examMeta);
+      }
+      if (parsed?.questions && parsed?.answers) {
+        return {
+          questions: parsed.questions,
+          answers: parsed.answers,
+        };
+      }
+      throw new Error('JSON trả về thiếu mảng variants.');
+    } catch (err: any) {
+      lastError = err;
+      const errMsg = err?.message || '';
+      // Do not retry fatal connection or unsupported-vision errors
+      if (
+        errMsg.includes('Không thể kết nối đến Ollama') ||
+        errMsg.includes('hiện không hỗ trợ đọc ảnh')
+      ) {
+        throw err;
+      }
+      if (attempt === 0) {
+        console.warn('Sinh đề Ollama lần 1 chưa hợp lệ, đang thử lại...', errMsg);
+      }
+    }
   }
 
-  // Parse JSON response safely (supports both unified `variants` schema and legacy `{questions, answers}`)
-  try {
-    const parsed = stripThinkingAndParseJson(rawContent);
-    if (Array.isArray(parsed?.variants) && parsed.variants.length > 0) {
-      return formatExamFromVariants(parsed.variants, examMeta);
-    }
-    if (parsed?.questions && parsed?.answers) {
+  // Heuristic fallback only if we actually received raw text on the last attempt
+  if (lastRawContent) {
+    const cleanedRaw = lastRawContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    const matchQuestions = cleanedRaw.match(/"questions"\s*:\s*"([\s\S]*?)",\s*"answers"/);
+    const matchAnswers = cleanedRaw.match(/"answers"\s*:\s*"([\s\S]*?)"\s*}/);
+    if (matchQuestions && matchAnswers) {
       return {
-        questions: parsed.questions,
-        answers: parsed.answers,
+        questions: matchQuestions[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
+        answers: matchAnswers[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
       };
     }
-  } catch (parseErr) {
-    console.warn("JSON parse failed in generateExamContentOllama, attempting heuristic recovery...", parseErr);
-  }
 
-  // Heuristic fallback if model returned raw markdown strings
-  const cleanedRaw = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  const matchQuestions = cleanedRaw.match(/"questions"\s*:\s*"([\s\S]*?)",\s*"answers"/);
-  const matchAnswers = cleanedRaw.match(/"answers"\s*:\s*"([\s\S]*?)"\s*}/);
-  if (matchQuestions && matchAnswers) {
+    if (cleanedRaw.includes('ĐÁP ÁN') || cleanedRaw.includes('ĐÁP ÁN ĐỀ SỐ')) {
+      const splitIndex = cleanedRaw.search(/(#+\s*ĐÁP ÁN|\|\s*\*\*ĐÁP ÁN|\*\*ĐÁP ÁN ĐỀ SỐ)/i);
+      if (splitIndex > 0) {
+        return {
+          questions: cleanedRaw.substring(0, splitIndex).trim(),
+          answers: cleanedRaw.substring(splitIndex).trim(),
+        };
+      }
+    }
+
     return {
-      questions: matchQuestions[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
-      answers: matchAnswers[1].replace(/\\n/g, '\n').replace(/\\"/g, '"'),
+      questions: cleanedRaw,
+      answers: "Vui lòng xem đáp án trong nội dung câu hỏi hoặc yêu cầu tạo lại.",
     };
   }
 
-  if (cleanedRaw.includes('ĐÁP ÁN') || cleanedRaw.includes('ĐÁP ÁN ĐỀ SỐ')) {
-    const splitIndex = cleanedRaw.search(/(#+\s*ĐÁP ÁN|\|\s*\*\*ĐÁP ÁN|\*\*ĐÁP ÁN ĐỀ SỐ)/i);
-    if (splitIndex > 0) {
-      return {
-        questions: cleanedRaw.substring(0, splitIndex).trim(),
-        answers: cleanedRaw.substring(splitIndex).trim(),
-      };
-    }
-  }
-
-  return {
-    questions: cleanedRaw,
-    answers: "Vui lòng xem đáp án trong nội dung câu hỏi hoặc yêu cầu tạo lại.",
-  };
+  throw lastError || new Error('Ollama không trả về nội dung hợp lệ.');
 };
 
 export const gradeSingleSubmissionOllama = async (
@@ -402,27 +555,60 @@ export const gradeSingleSubmissionOllama = async (
   const images: string[] = [];
   let extraText = '';
   let submissionHasText = true;
+  let examNormalizedText = '';
 
   if (options?.masterRubric && options.masterRubric.trim()) {
-    extraText += `\n[BẢNG BAREM THANG ĐIỂM BẮT BUỘC DÙNG CHUNG CHO TẤT CẢ CÁC BÀI THI]:\n${options.masterRubric.trim()}\n\nQUY TẮC CỐ ĐỊNH BAREM: Bắt buộc liệt kê đầy đủ tất cả các câu trên vào bảng điểm của thí sinh này. Câu nào thí sinh không giải/bỏ trống bắt buộc ghi rõ vào bảng và cho 0.0đ. Tuyệt đối không được thay đổi thang điểm tối đa của từng câu.\n`;
+    extraText += `\n[BẢNG BAREM THANG ĐIỂM BẮT BUỘC DÙNG CHUNG CHO TẤT CẢ CÁC BÀI THI]:\n${options.masterRubric.trim()}\n\nQUY TẮC CỐ ĐỊNH BAREM: Bắt buộc tạo đủ TẤT CẢ các phần tử tương ứng trong mảng "questionRows" với đúng tên câu và đúng "maxScore". Câu nào thí sinh không giải/bỏ trống bắt buộc ghi studentAnswer: "Bỏ trống", isFinalCorrect: "Không làm", gradingMethod: "Bỏ trống", earnedScore: 0.\n`;
   }
 
   if (options?.examQuestionFile) {
-    const qRes = await appendFileForOllama(options.examQuestionFile, 'TỆP ĐỀ BÀI (ĐỀ THI GỐC)', images, 5);
+    // Exam question docs typically contain selectable text; skip heavy JPEG rendering unless scanned
+    const qRes = await appendFileForOllama(options.examQuestionFile, 'TỆP ĐỀ BÀI (ĐỀ THI GỐC)', images, {
+      maxPdfRenderPages: 4,
+      onlyRenderIfNoText: true,
+    });
     extraText += qRes.textBlock;
+    examNormalizedText = qRes.normalizedText;
   }
 
   if (options?.examQuestionText && options.examQuestionText.trim()) {
     extraText += `\n[NỘI DUNG ĐỀ BÀI (ĐỀ THI GỐC) ĐƯỢC GIÁO VIÊN CUNG CẤP]:\n${options.examQuestionText.trim()}\n`;
   }
 
-  const subRes = await appendFileForOllama(submissionFile, 'TÀI LIỆU BÀI LÀM CỦA THÍ SINH', images, 6);
+  // Always render up to 4 pages of the student's PDF submission so handwriting & circled answers are visible
+  const subRes = await appendFileForOllama(submissionFile, 'TÀI LIỆU BÀI LÀM CỦA THÍ SINH', images, {
+    maxPdfRenderPages: 4,
+    onlyRenderIfNoText: false,
+  });
   extraText += subRes.textBlock;
   submissionHasText = subRes.hasExtractedText;
 
   if (answerKeyFile) {
-    const kRes = await appendFileForOllama(answerKeyFile, 'TỆP ĐÁP ÁN CHUẨN & THANG ĐIỂM ĐỐI CHIẾU', images, 5);
-    extraText += kRes.textBlock;
+    const isSameMetadata =
+      options?.examQuestionFile &&
+      answerKeyFile.name === options.examQuestionFile.name &&
+      answerKeyFile.size === options.examQuestionFile.size;
+
+    if (isSameMetadata) {
+      extraText += `\n--- [TỆP ĐÁP ÁN CHUẨN] File "${answerKeyFile.name}" ---\n(Trùng với tệp đề bài đã đính kèm ở trên — hãy dùng cả phần đề và đáp án/hướng dẫn chấm trong tệp đó).\n`;
+    } else {
+      const tempImages: string[] = [];
+      const kRes = await appendFileForOllama(answerKeyFile, 'TỆP ĐÁP ÁN CHUẨN & THANG ĐIỂM ĐỐI CHIẾU', tempImages, {
+        maxPdfRenderPages: 4,
+        onlyRenderIfNoText: true,
+      });
+      const isDuplicateText =
+        Boolean(examNormalizedText) &&
+        Boolean(kRes.normalizedText) &&
+        kRes.normalizedText === examNormalizedText;
+
+      if (isDuplicateText) {
+        extraText += `\n--- [TỆP ĐÁP ÁN CHUẨN] File "${answerKeyFile.name}" ---\n(Nội dung trùng với tệp đề bài đã đính kèm ở trên).\n`;
+      } else {
+        extraText += kRes.textBlock;
+        tempImages.forEach((b64) => images.push(b64));
+      }
+    }
   }
 
   if (options?.answerKeyText && options.answerKeyText.trim()) {
@@ -438,25 +624,49 @@ export const gradeSingleSubmissionOllama = async (
     fastFinalResultGrading: fastRule,
   });
 
+  const systemInstruction = `${GRADING_SYSTEM_INSTRUCTION}
+
+QUY ĐỊNH XUẤT DỮ LIỆU CÓ CẤU TRÚC CHO HỆ THỐNG (QUAN TRỌNG):
+- Thay vì tự vẽ bảng Markdown bằng tay (dễ vỡ cột/sai phép cộng), bạn PHẢI trả về đầy đủ mảng "questionRows" trong JSON. Hệ thống sẽ tự động tính tổng điểm chính xác và dựng Phiếu chấm điểm chuẩn Đại học từ mảng này.
+- Với MỖI câu / ý trong đề thi (từ Câu 1 đến câu cuối cùng, tổng maxScore toàn bài đúng bằng 10.0), tạo 1 object trong "questionRows":
+  * "question": Tên câu / ý ngắn gọn khớp barem (vd: "Câu 1a", "Câu 1b", "Câu 2a"...).
+  * "requirement": Tóm tắt ngắn yêu cầu của câu.
+  * "studentAnswer": Đáp án / kết quả cuối thí sinh làm được (nếu không làm ghi "Bỏ trống").
+  * "isFinalCorrect": Chỉ ghi ngắn gọn "Đúng", "Sai", "Thiếu", hoặc "Không làm".
+  * "gradingMethod": Chỉ ghi "Trọn điểm (Đúng KQ cuối)", "Chấm thành phần (Sai KQ cuối)", hoặc "Bỏ trống".
+  * "maxScore": Số điểm tối đa của câu/ý (kiểu số, vd: 2.5).
+  * "earnedScore": Số điểm thí sinh đạt được từ 0 đến maxScore (kiểu số, bước 0.25, vd: 1.75; nếu "Không làm" bắt buộc = 0).
+  * "comment": Nhận xét ngắn gọn lý do trừ điểm hoặc các bước đúng thành phần.`;
+
   const userPrompt = `${extraText}\n${userGradingRequirements}\n
-BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn bản ngoài JSON):
+BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn bản hay bảng Markdown bên ngoài):
 {
   "students": [
     {
       "studentName": "Họ và tên thí sinh trích xuất từ bài thi",
-      "studentId": "MSSV hoặc SBD nếu có",
-      "className": "Lớp nếu có",
-      "examCode": "Mã đề nếu có",
-      "score": "6.75/10",
-      "totalScoreNum": 6.75,
-      "scoreText": "Sáu phẩy bảy lăm",
-      "feedback": "Toàn bộ PHIẾU CHẤM ĐIỂM THI KẾT THÚC HỌC PHẦN Markdown đúng khuôn mẫu quy định"
+      "studentId": "MSSV hoặc SBD nếu có (nếu không ghi 'Không có')",
+      "className": "Lớp nếu có (nếu không ghi 'Không có')",
+      "examCode": "Mã đề nếu có (nếu không ghi 'Không có')",
+      "questionRows": [
+        {
+          "question": "Câu 1a",
+          "requirement": "Tính vận tốc tức thời...",
+          "studentAnswer": "v = 12 m/s",
+          "isFinalCorrect": "Đúng",
+          "gradingMethod": "Trọn điểm (Đúng KQ cuối)",
+          "maxScore": 2.5,
+          "earnedScore": 2.5,
+          "comment": "Lời giải đầy đủ và đáp số chính xác."
+        }
+      ],
+      "strengths": "Tóm tắt ưu điểm chính của bài làm",
+      "weaknesses": "Tóm tắt hạn chế / câu làm sai hoặc bỏ trống"
     }
   ]
 }`;
 
   const messages: any[] = [
-    { role: 'system', content: GRADING_SYSTEM_INSTRUCTION },
+    { role: 'system', content: systemInstruction },
     {
       role: 'user',
       content: userPrompt,
@@ -468,57 +678,92 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
     model: ollamaConfig.model,
     messages,
     stream: false,
-    format: 'json',
+    think: false,
+    keep_alive: '10m',
+    format: OLLAMA_GRADING_SCHEMA,
     options: {
       temperature: 0.0,
       seed: 42,
+      top_k: 1,
+      top_p: 1.0,
+      repeat_penalty: 1.0,
       num_ctx: 16384,
+      num_predict: 4096,
     },
   };
 
-  const data = await callOllamaApi(ollamaConfig, '/api/chat', payload, submissionHasText);
+  const defaultName = studentName || submissionFile.name.replace(/\.[^/.]+$/, '');
+  let parsed: any = null;
+  let lastRawContent = '';
+  let lastError: any = null;
 
-  const rawContent = data?.message?.content || data?.response || '';
-  if (!rawContent) {
-    throw new Error('Ollama không phản hồi kết quả chấm thi.');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const data = await callOllamaApi(ollamaConfig, '/api/chat', payload, submissionHasText);
+      const rawContent = data?.message?.content || data?.response || '';
+      if (!rawContent) {
+        throw new Error('Ollama không phản hồi kết quả chấm thi.');
+      }
+      lastRawContent = rawContent;
+      parsed = stripThinkingAndParseJson(rawContent);
+      break;
+    } catch (err: any) {
+      lastError = err;
+      const errMsg = err?.message || '';
+      if (
+        errMsg.includes('Không thể kết nối đến Ollama') ||
+        errMsg.includes('hiện không hỗ trợ đọc ảnh')
+      ) {
+        throw err;
+      }
+      if (attempt === 0) {
+        console.warn('Chấm bài Ollama lần 1 lỗi parse/mạng, đang thử lại...', errMsg);
+      }
+    }
   }
 
-  try {
-    const parsed = stripThinkingAndParseJson(rawContent);
+  if (parsed) {
+    const rawStudents: StructuredGradedStudent[] =
+      Array.isArray(parsed?.students) && parsed.students.length > 0
+        ? parsed.students
+        : [parsed];
 
-    const studentsList = Array.isArray(parsed?.students) && parsed.students.length > 0
-      ? parsed.students
-      : [{
-          studentName: parsed?.studentName || studentName || submissionFile.name.replace(/\.[^/.]+$/, ''),
-          studentId: parsed?.studentId || '',
-          className: parsed?.className || '',
-          examCode: parsed?.examCode || '',
-          score: parsed?.score || 'N/A',
-          totalScoreNum: parsed?.totalScoreNum,
-          scoreText: parsed?.scoreText || '',
-          feedback: parsed?.feedback || rawContent,
-        }];
+    const finalStudents = rawStudents.map((rawSt) => {
+      if (Array.isArray(rawSt?.questionRows) && rawSt.questionRows.length > 0) {
+        return formatGradingFeedbackFromStructured(rawSt, defaultName, options?.masterRubric);
+      }
+      const legacyStudent = {
+        studentName: rawSt?.studentName || defaultName,
+        studentId: rawSt?.studentId || '',
+        className: rawSt?.className || '',
+        examCode: rawSt?.examCode || '',
+        score: rawSt?.score || 'N/A',
+        totalScoreNum: rawSt?.totalScoreNum,
+        scoreText: rawSt?.scoreText || '',
+        feedback: rawSt?.feedback || lastRawContent,
+      };
+      synchronizeStudentScores([legacyStudent]);
+      return legacyStudent;
+    });
 
-    // Programmatically compute exact sum from table & synchronize GPA4 / Letter / Rank (identical to Gemini)
-    synchronizeStudentScores(studentsList);
-
-    const first = studentsList[0];
+    const first = finalStudents[0];
     return {
-      students: studentsList,
+      students: finalStudents,
       content: first.feedback,
       score: first.score,
-      studentName: first.studentName || studentName || submissionFile.name.replace(/\.[^/.]+$/, ''),
+      studentName: first.studentName || defaultName,
       studentId: first.studentId,
       className: first.className,
       examCode: first.examCode,
     };
-  } catch {
-    const cleanedFallback = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  }
+
+  if (lastRawContent) {
+    const cleanedFallback = lastRawContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
     const scoreMatch = cleanedFallback.match(/(\d+(?:\.\d+)?\s*\/\s*10)/);
     const fallbackScore = scoreMatch ? scoreMatch[1] : 'Đã chấm';
-    const fallbackName = studentName || submissionFile.name.replace(/\.[^/.]+$/, '');
     const fallbackList = [{
-      studentName: fallbackName,
+      studentName: defaultName,
       score: fallbackScore,
       feedback: cleanedFallback,
     }];
@@ -527,9 +772,11 @@ BẮT BUỘC TRẢ VỀ ĐÚNG ĐỊNH DẠNG JSON SAU (không viết thêm văn
       students: fallbackList,
       content: fallbackList[0].feedback,
       score: fallbackList[0].score,
-      studentName: fallbackName,
+      studentName: defaultName,
     };
   }
+
+  throw lastError || new Error('Ollama không phản hồi kết quả chấm thi.');
 };
 
 export const gradeSubmissionOllama = async (

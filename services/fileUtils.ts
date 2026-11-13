@@ -29,7 +29,7 @@ const fileContentCache = new WeakMap<File, Promise<{
   mimeType: string;
 }>>();
 
-const pdfOllamaCache = new WeakMap<File, Promise<{
+const pdfOllamaCache = new Map<string, Promise<{
   text: string;
   images: string[];
   pageCount: number;
@@ -37,10 +37,13 @@ const pdfOllamaCache = new WeakMap<File, Promise<{
 
 export const extractPdfForOllama = async (
   file: File,
-  maxRenderPages = 6
+  maxRenderPages = 4,
+  onlyRenderIfNoText = false
 ): Promise<{ text: string; images: string[]; pageCount: number }> => {
-  if (pdfOllamaCache.has(file)) {
-    return pdfOllamaCache.get(file)!;
+  const cacheKey = `${file.name}:${file.size}:${file.lastModified}:${maxRenderPages}:${onlyRenderIfNoText ? 1 : 0}`;
+  const existing = pdfOllamaCache.get(cacheKey);
+  if (existing) {
+    return existing;
   }
 
   const promise = (async () => {
@@ -50,11 +53,12 @@ export const extractPdfForOllama = async (
     const pageCount = pdf.numPages || 0;
 
     const textParts: string[] = [];
-    const images: string[] = [];
-
+    const pages: any[] = [];
     const maxTextPages = Math.min(pageCount, 20);
+
     for (let p = 1; p <= maxTextPages; p++) {
       const page = await pdf.getPage(p);
+      pages.push(page);
       try {
         const textContent = await page.getTextContent();
         const pageText = (textContent.items || [])
@@ -68,12 +72,20 @@ export const extractPdfForOllama = async (
       } catch (txtErr) {
         console.warn(`Could not extract text from page ${p} of ${file.name}:`, txtErr);
       }
+    }
 
-      if (p <= maxRenderPages && typeof document !== 'undefined') {
+    const combinedText = textParts.join('\n').trim();
+    const images: string[] = [];
+    const shouldRenderImages = !onlyRenderIfNoText || combinedText.length < 80;
+
+    if (shouldRenderImages && typeof document !== 'undefined') {
+      const renderLimit = Math.min(pages.length, maxRenderPages);
+      for (let i = 0; i < renderLimit; i++) {
+        const page = pages[i];
         try {
           const baseViewport = page.getViewport({ scale: 1 });
           const maxDim = Math.max(baseViewport.width, baseViewport.height, 1);
-          const scale = Math.min(2.0, Math.max(1.0, 1400 / maxDim));
+          const scale = Math.min(2.0, Math.max(1.0, 1200 / maxDim));
           const viewport = page.getViewport({ scale });
 
           const canvas = document.createElement('canvas');
@@ -89,19 +101,19 @@ export const extractPdfForOllama = async (
             if (b64) images.push(b64);
           }
         } catch (renderErr) {
-          console.warn(`Could not render page ${p} of ${file.name} for Ollama:`, renderErr);
+          console.warn(`Could not render page ${i + 1} of ${file.name} for Ollama:`, renderErr);
         }
       }
     }
 
     return {
-      text: textParts.join('\n').trim(),
+      text: combinedText,
       images,
       pageCount,
     };
   })();
 
-  pdfOllamaCache.set(file, promise);
+  pdfOllamaCache.set(cacheKey, promise);
   return promise;
 };
 

@@ -463,6 +463,31 @@ export function extractExactScoreFromFeedback(md: string): number | null {
   return null;
 }
 
+export function getGradeMetadata(exactScore: number): { gpa4: number; gradeLetter: string; rank: string } {
+  if (exactScore >= 8.5) {
+    return { gpa4: 4.0, gradeLetter: 'A', rank: 'Xuất sắc' };
+  }
+  if (exactScore >= 8.0) {
+    return { gpa4: 3.5, gradeLetter: 'B+', rank: 'Giỏi' };
+  }
+  if (exactScore >= 7.0) {
+    return { gpa4: 3.0, gradeLetter: 'B', rank: 'Khá' };
+  }
+  if (exactScore >= 6.5) {
+    return { gpa4: 2.5, gradeLetter: 'C+', rank: 'Trung bình khá' };
+  }
+  if (exactScore >= 5.5) {
+    return { gpa4: 2.0, gradeLetter: 'C', rank: 'Trung bình' };
+  }
+  if (exactScore >= 5.0) {
+    return { gpa4: 1.5, gradeLetter: 'D+', rank: 'Trung bình yếu' };
+  }
+  if (exactScore >= 4.0) {
+    return { gpa4: 1.0, gradeLetter: 'D', rank: 'Đạt (yếu)' };
+  }
+  return { gpa4: 0.0, gradeLetter: 'F', rank: 'Chưa đạt (Kém)' };
+}
+
 export function synchronizeStudentScores(students: any[]): void {
   for (const st of students) {
     const exactScore = extractExactScoreFromFeedback(st.feedback);
@@ -476,27 +501,7 @@ export function synchronizeStudentScores(students: any[]): void {
       fb = fb.replace(/(-\s*\*\*(?:TỔNG ĐIỂM CHÍNH THỨC|Tổng điểm chính thức|Tổng điểm):\*\*\s*\*\*?).*?(\/\s*10\*\*?)/i, `$1${exactScore} $2`);
       fb = fb.replace(/(\*Bằng chữ:\s*)[^*]+(\*)/i, `$1${st.scoreText}$2`);
 
-      let gpa4 = 0.0;
-      let gradeLetter = 'F';
-      let rank = 'Chưa đạt';
-
-      if (exactScore >= 8.5) {
-        gpa4 = 4.0; gradeLetter = 'A'; rank = 'Xuất sắc';
-      } else if (exactScore >= 8.0) {
-        gpa4 = 3.5; gradeLetter = 'B+'; rank = 'Giỏi';
-      } else if (exactScore >= 7.0) {
-        gpa4 = 3.0; gradeLetter = 'B'; rank = 'Khá';
-      } else if (exactScore >= 6.5) {
-        gpa4 = 2.5; gradeLetter = 'C+'; rank = 'Trung bình khá';
-      } else if (exactScore >= 5.5) {
-        gpa4 = 2.0; gradeLetter = 'C'; rank = 'Trung bình';
-      } else if (exactScore >= 5.0) {
-        gpa4 = 1.5; gradeLetter = 'D+'; rank = 'Trung bình yếu';
-      } else if (exactScore >= 4.0) {
-        gpa4 = 1.0; gradeLetter = 'D'; rank = 'Đạt (yếu)';
-      } else {
-        gpa4 = 0.0; gradeLetter = 'F'; rank = 'Chưa đạt (Kém)';
-      }
+      const { gpa4, gradeLetter, rank } = getGradeMetadata(exactScore);
 
       fb = fb.replace(/(-\s*\*\*Thang điểm 4:\*\*\s*\*\*).*?(?=\n|$)/i, `- **Thang điểm 4:** **${gpa4.toFixed(1)} / 4.0** | **Điểm chữ:** **${gradeLetter}**`);
       fb = fb.replace(/(-\s*\*\*(?:Xếp loại|Xếp loại học lực):\*\*\s*\*\*).*?(?=\n|$)/i, `- **Xếp loại:** **${rank}**`);
@@ -507,4 +512,268 @@ export function synchronizeStudentScores(students: any[]): void {
       st.score = `${rounded}/10`;
     }
   }
+}
+
+export interface StructuredQuestionGradeRow {
+  question: string;
+  requirement?: string;
+  studentAnswer?: string;
+  isFinalCorrect?: string;
+  gradingMethod?: string;
+  maxScore: number;
+  earnedScore: number;
+  comment?: string;
+}
+
+export interface StructuredGradedStudent {
+  studentName?: string;
+  studentId?: string;
+  className?: string;
+  examCode?: string;
+  questionRows?: StructuredQuestionGradeRow[];
+  strengths?: string;
+  weaknesses?: string;
+  feedback?: string;
+  score?: string;
+  totalScoreNum?: number;
+  scoreText?: string;
+}
+
+const roundScore2 = (val: number): number => {
+  const r = Math.round(val * 100) / 100;
+  return Object.is(r, -0) ? 0 : r;
+};
+
+const parseNumericScore = (val: any, fallback = 0): number => {
+  if (typeof val === 'number' && Number.isFinite(val)) return val;
+  if (typeof val === 'string') {
+    const cleaned = val.replace(',', '.').match(/-?\d+(?:\.\d+)?/);
+    if (cleaned) {
+      const n = parseFloat(cleaned[0]);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return fallback;
+};
+
+const sanitizeTableCell = (val: any, fallback = ''): string => {
+  const s = String(val ?? '').trim();
+  if (!s) return fallback;
+  return s.replace(/\r?\n/g, '<br>').replace(/\|/g, '/').replace(/\s+/g, ' ').trim();
+};
+
+const normalizeQuestionKey = (q: string): string => {
+  return String(q || '')
+    .replace(/\*\*/g, '')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/[.:：\-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+};
+
+const compactQuestionKey = (q: string): string => {
+  return normalizeQuestionKey(q)
+    .replace(/^(?:câu|bài|ý|phần)\s*/i, '')
+    .replace(/\s+/g, '');
+};
+
+export function parseMasterRubricItems(masterRubric?: string): Array<{ question: string; maxScore: number }> {
+  if (!masterRubric || typeof masterRubric !== 'string') return [];
+  const items: Array<{ question: string; maxScore: number }> = [];
+  const lines = masterRubric.split(/\r?\n/);
+
+  for (const line of lines) {
+    const m = line.match(/^\s*[-*]?\s*(.+?)\s*:\s*Thang điểm tối đa\s*([^\s]+(?:\s*đ)?)/i);
+    if (!m) continue;
+    const rawName = m[1].replace(/\*\*/g, '').trim();
+    const maxScore = roundScore2(Math.max(0, parseNumericScore(m[2], 0)));
+    if (rawName && maxScore > 0) {
+      items.push({ question: rawName, maxScore });
+    }
+  }
+
+  return items;
+}
+
+export function enforceMasterRubricOnRows(
+  rawRows: StructuredQuestionGradeRow[],
+  masterRubric?: string
+): StructuredQuestionGradeRow[] {
+  const sanitized: StructuredQuestionGradeRow[] = (Array.isArray(rawRows) ? rawRows : []).map((r, idx) => {
+    const question = sanitizeTableCell(r?.question, `Câu ${idx + 1}`);
+    const maxScore = roundScore2(Math.max(0, parseNumericScore(r?.maxScore, 0)));
+    let earnedScore = roundScore2(Math.max(0, parseNumericScore(r?.earnedScore, 0)));
+
+    const finalEval = sanitizeTableCell(r?.isFinalCorrect, '');
+    const method = sanitizeTableCell(r?.gradingMethod, '');
+    const studentAns = sanitizeTableCell(r?.studentAnswer, '');
+
+    if (
+      /không làm|bỏ trống/i.test(finalEval) ||
+      /^bỏ trống$/i.test(method) ||
+      /^bỏ trống$/i.test(studentAns)
+    ) {
+      earnedScore = 0;
+    }
+
+    if (maxScore > 0) {
+      earnedScore = Math.min(maxScore, earnedScore);
+    } else {
+      earnedScore = Math.min(10, earnedScore);
+    }
+
+    return {
+      question,
+      requirement: sanitizeTableCell(r?.requirement, 'Theo đề thi'),
+      studentAnswer: studentAns || 'Không ghi',
+      isFinalCorrect: finalEval || (earnedScore >= maxScore && maxScore > 0 ? 'Đúng' : earnedScore > 0 ? 'Sai / Thiếu' : 'Sai'),
+      gradingMethod: method || (earnedScore >= maxScore && maxScore > 0 ? 'Trọn điểm (Đúng KQ cuối)' : earnedScore > 0 ? 'Chấm thành phần (Sai KQ cuối)' : 'Sai / Không có điểm'),
+      maxScore,
+      earnedScore,
+      comment: sanitizeTableCell(r?.comment, earnedScore >= maxScore && maxScore > 0 ? 'Đạt điểm tối đa' : ''),
+    };
+  });
+
+  const rubricItems = parseMasterRubricItems(masterRubric);
+  if (rubricItems.length === 0) {
+    return sanitized;
+  }
+
+  const usedIndices = new Set<number>();
+  const matchedRows: StructuredQuestionGradeRow[] = [];
+
+  for (const item of rubricItems) {
+    const targetNorm = normalizeQuestionKey(item.question);
+    const targetCompact = compactQuestionKey(item.question);
+
+    let matchIdx = sanitized.findIndex((r, i) => !usedIndices.has(i) && normalizeQuestionKey(r.question) === targetNorm);
+    if (matchIdx === -1 && targetCompact) {
+      matchIdx = sanitized.findIndex((r, i) => !usedIndices.has(i) && compactQuestionKey(r.question) === targetCompact);
+    }
+
+    if (matchIdx !== -1) {
+      usedIndices.add(matchIdx);
+      const matched = sanitized[matchIdx];
+      const clampedEarned = roundScore2(Math.max(0, Math.min(item.maxScore, matched.earnedScore)));
+      matchedRows.push({
+        ...matched,
+        question: item.question,
+        maxScore: item.maxScore,
+        earnedScore: clampedEarned,
+      });
+    } else {
+      matchedRows.push({
+        question: item.question,
+        requirement: 'Theo đề thi & barem chuẩn',
+        studentAnswer: 'Bỏ trống',
+        isFinalCorrect: 'Không làm',
+        gradingMethod: 'Bỏ trống',
+        maxScore: item.maxScore,
+        earnedScore: 0,
+        comment: 'Thí sinh không làm câu này (0.0đ)',
+      });
+    }
+  }
+
+  const rubricTotalMax = rubricItems.reduce((acc, item) => acc + item.maxScore, 0);
+  // Only append unmatched extra rows if rubric did not cover the full 10-point exam
+  if (rubricTotalMax < 9.5) {
+    sanitized.forEach((r, idx) => {
+      if (!usedIndices.has(idx)) {
+        matchedRows.push(r);
+      }
+    });
+  }
+
+  return matchedRows;
+}
+
+export function formatGradingFeedbackFromStructured(
+  st: StructuredGradedStudent,
+  fallbackStudentName?: string,
+  masterRubric?: string
+): {
+  studentName: string;
+  studentId: string;
+  className: string;
+  examCode: string;
+  score: string;
+  totalScoreNum: number;
+  scoreText: string;
+  feedback: string;
+  questionRows: StructuredQuestionGradeRow[];
+  strengths: string;
+  weaknesses: string;
+} {
+  const normalizedRows = enforceMasterRubricOnRows(st.questionRows || [], masterRubric);
+  const rawTotal = normalizedRows.reduce((sum, r) => sum + (Number.isFinite(r.earnedScore) ? r.earnedScore : 0), 0);
+  const totalScoreNum = roundScore2(Math.max(0, Math.min(10, rawTotal)));
+  const score = `${totalScoreNum}/10`;
+  const scoreText = numberToVietnameseScore(totalScoreNum);
+  const { gpa4, gradeLetter, rank } = getGradeMetadata(totalScoreNum);
+
+  const studentName = String(st.studentName || fallbackStudentName || 'Thí sinh').trim();
+  const studentId = String(st.studentId || 'Không có').trim() || 'Không có';
+  const className = String(st.className || 'Không có').trim() || 'Không có';
+  const examCode = String(st.examCode || 'Không có').trim() || 'Không có';
+
+  const strengths = String(st.strengths || '').trim() ||
+    (totalScoreNum >= 5 ? 'Nắm được kiến thức cơ bản và trình bày được một số phần trọng tâm.' : 'Có cố gắng hoàn thành một phần bài làm.');
+  const weaknesses = String(st.weaknesses || '').trim() ||
+    (totalScoreNum >= 9 ? 'Không có sai sót đáng kể.' : 'Cần rà soát lại các câu làm sai, thiếu bước biến đổi hoặc bỏ trống.');
+
+  const tableLines: string[] = [
+    '| Câu / Ý | Yêu cầu đề bài | Kết quả cuối của HS | Đánh giá KQ cuối | Phương thức chấm | Thang điểm | Điểm đạt | Nhận xét chi tiết (Thành phần nếu sai) |',
+    '| :---: | :--- | :--- | :---: | :---: | :---: | :---: | :--- |',
+  ];
+
+  for (const row of normalizedRows) {
+    tableLines.push(
+      `| ${row.question} | ${row.requirement || 'Theo đề thi'} | ${row.studentAnswer || 'Bỏ trống'} | ${row.isFinalCorrect || 'Không làm'} | ${row.gradingMethod || 'Bỏ trống'} | ${row.maxScore} | ${row.earnedScore} | ${row.comment || ''} |`
+    );
+  }
+
+  const totalMaxSum = roundScore2(normalizedRows.reduce((sum, r) => sum + (Number.isFinite(r.maxScore) ? r.maxScore : 0), 0));
+  tableLines.push(
+    `| **TỔNG ĐIỂM** | | | | | **${totalMaxSum > 0 ? totalMaxSum : 10}** | **${totalScoreNum}** | |`
+  );
+
+  const feedback = [
+    '# PHIẾU CHẤM ĐIỂM THI KẾT THÚC HỌC PHẦN',
+    '',
+    `- **Họ và tên thí sinh:** ${studentName}`,
+    `- **Mã số sinh viên (MSSV / SBD):** ${studentId}`,
+    `- **Lớp / Khóa:** ${className}`,
+    `- **Mã đề thi:** ${examCode}`,
+    '',
+    '### BẢNG ĐIỂM CHI TIẾT TỪNG CÂU',
+    ...tableLines,
+    '',
+    '### TỔNG KẾT ĐÁNH GIÁ & XẾP LOẠI',
+    `- **TỔNG ĐIỂM CHÍNH THỨC:** **${totalScoreNum} / 10** (*Bằng chữ: ${scoreText}*)`,
+    `- **Thang điểm 4:** **${gpa4.toFixed(1)} / 4.0** | **Điểm chữ:** **${gradeLetter}**`,
+    `- **Xếp loại:** **${rank}**`,
+    '- **Nhận xét chung:**',
+    `  - **Ưu điểm:** ${strengths}`,
+    `  - **Hạn chế / Lưu ý:** ${weaknesses}`,
+    '',
+    '| CÁN BỘ CHẤM THI 1 | CÁN BỘ CHẤM THI 2 |',
+    '| :---: | :---: |',
+    '| *(Ký và ghi rõ họ tên)* | *(Ký và ghi rõ họ tên)* |',
+  ].join('\n');
+
+  return {
+    studentName,
+    studentId,
+    className,
+    examCode,
+    score,
+    totalScoreNum,
+    scoreText,
+    feedback,
+    questionRows: normalizedRows,
+    strengths,
+    weaknesses,
+  };
 }
