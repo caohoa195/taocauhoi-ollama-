@@ -1,12 +1,58 @@
 import express from "express";
+import fs from "fs";
 import path from "path";
 import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 import {
     formatExamFromVariants,
     getExamSystemInstruction,
     GRADING_SYSTEM_INSTRUCTION,
+    parseJsonWithLatexFix,
     synchronizeStudentScores
 } from "./utils/examHelpers";
+
+const loadEnvFileIfPresent = (filename: string) => {
+    try {
+        const filePath = path.resolve(process.cwd(), filename);
+        if (!fs.existsSync(filePath)) return;
+        const raw = fs.readFileSync(filePath, "utf-8");
+        for (const line of raw.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith("#")) continue;
+            const eqIdx = trimmed.indexOf("=");
+            if (eqIdx <= 0) continue;
+            const key = trimmed.slice(0, eqIdx).trim();
+            let val = trimmed.slice(eqIdx + 1).trim();
+            if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                val = val.slice(1, -1).trim();
+            }
+            if (key && (!process.env[key] || !process.env[key]!.trim()) && val) {
+                process.env[key] = val;
+            }
+        }
+    } catch (e) {
+        console.warn(`Could not read ${filename}:`, e);
+    }
+};
+
+loadEnvFileIfPresent(".env");
+loadEnvFileIfPresent(".env.local");
+
+const formatGeminiErrorMessage = (error: any): string => {
+    const message = error?.message || "Lỗi không xác định";
+    if (message.includes("API key not valid") || message.includes("API_KEY_INVALID")) {
+        return "API key không hợp lệ hoặc đã hết hạn. Vui lòng kiểm tra lại giá trị GEMINI_API_KEY (không dư khoảng trắng/ký tự lạ).";
+    }
+    if (message.includes("API_KEY_SERVICE_BLOCKED") || message.includes("PERMISSION_DENIED") || message.includes("403")) {
+        return "API key không có quyền gọi Gemini API (Generative Language API chưa bật hoặc key bị giới hạn IP/referrer).";
+    }
+    if (message.includes("RESOURCE_EXHAUSTED") || message.includes("429") || message.toLowerCase().includes("quota")) {
+        return "API key đã vượt quá hạn mức (Quota 429). Vui lòng đợi vài phút hoặc kiểm tra hạn mức/thanh toán của API key.";
+    }
+    if (message.includes("DEADLINE_EXCEEDED") || message.includes("504") || message.includes("Headers Timeout") || message.includes("fetch failed")) {
+        return "Thời gian phản hồi từ Gemini API quá hạn. Vui lòng thử lại hoặc chuyển sang mô hình Ollama cục bộ.";
+    }
+    return message;
+};
 
 async function startServer() {
     const app = express();
@@ -14,16 +60,21 @@ async function startServer() {
 
     app.use(express.json({ limit: '50mb' }));
 
-    // Gemini AI client helper with fast responsive timeout
+    // Gemini AI client helper supporting GEMINI_API_KEY, GOOGLE_API_KEY, and API_KEY
     const getAI = () => {
-        const apiKey = process.env.GEMINI_API_KEY;
+        const apiKey = (
+            process.env.GEMINI_API_KEY ||
+            process.env.GOOGLE_API_KEY ||
+            process.env.API_KEY ||
+            ""
+        ).trim();
         if (!apiKey) {
-            throw new Error("GEMINI_API_KEY chưa được cấu hình. Vui lòng kiểm tra lại API key trong Settings > Secrets.");
+            throw new Error("GEMINI_API_KEY chưa được cấu hình. Vui lòng kiểm tra lại API key trong Settings > Secrets (hoặc file .env) và khởi động lại ứng dụng.");
         }
         return new GoogleGenAI({
             apiKey,
             httpOptions: {
-                timeout: 45000, // 45 seconds max timeout per request
+                timeout: 120000, // 120 seconds timeout for multi-page PDF / multi-variant exam requests
                 headers: {
                     'User-Agent': 'aistudio-build',
                 }
@@ -173,7 +224,10 @@ async function startServer() {
         try {
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), 3000);
-            const response = await fetch(`${cleanUrl}/api/tags`, { signal: controller.signal });
+            const response = await fetch(`${cleanUrl}/api/tags`, {
+                headers: { 'ngrok-skip-browser-warning': 'true' },
+                signal: controller.signal
+            });
             clearTimeout(timeout);
 
             if (!response.ok) {
@@ -201,7 +255,10 @@ async function startServer() {
             const timeout = setTimeout(() => controller.abort(), 300000); // 5 min timeout
             const response = await fetch(`${targetUrl}${targetEndpoint}`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'ngrok-skip-browser-warning': 'true'
+                },
                 body: JSON.stringify(payload),
                 signal: controller.signal
             });
@@ -233,15 +290,9 @@ async function startServer() {
             const sanitizedParts = await sanitizePartsForGemini(parts);
 
             const parseExamJson = (raw: string) => {
-                const cleaned = raw.replace(/```json\n?|\n?```/g, '').trim();
                 try {
-                    return JSON.parse(cleaned);
+                    return parseJsonWithLatexFix(raw);
                 } catch {
-                    const start = cleaned.indexOf('{');
-                    const end = cleaned.lastIndexOf('}');
-                    if (start !== -1 && end > start) {
-                        return JSON.parse(cleaned.slice(start, end + 1));
-                    }
                     throw new Error("Phản hồi tạo đề từ AI không đúng định dạng JSON.");
                 }
             };
@@ -321,6 +372,9 @@ async function startServer() {
                 } catch (err: any) {
                     lastModelError = err;
                     console.warn(`Model ${modelName} failed for exam generation:`, err.message);
+                    if (err?.message?.includes("API_KEY_INVALID") || err?.message?.includes("API key not valid")) {
+                        break;
+                    }
                 }
             }
             if (!parsedResult) {
@@ -334,13 +388,7 @@ async function startServer() {
             res.json(parsedResult);
         } catch (error: any) {
             console.error("Error generating exam:", error);
-            let message = error.message || "Lỗi không xác định";
-            if (message.includes("API key not valid") || message.includes("API_KEY_INVALID")) {
-                message = "API key không hợp lệ hoặc đã hết hạn. Vui lòng chọn hoặc cấu hình lại API key.";
-            } else if (message.includes("DEADLINE_EXCEEDED") || message.includes("504")) {
-                message = "Thời gian phản hồi từ AI quá dài (DEADLINE_EXCEEDED). Vui lòng thử lại với cấu hình gọn hơn hoặc dùng Ollama cục bộ.";
-            }
-            res.status(500).json({ error: message });
+            res.status(500).json({ error: formatGeminiErrorMessage(error) });
         }
     });
 
@@ -420,44 +468,39 @@ async function startServer() {
             };
 
             let responseText = "";
+            const gradingModels = ["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-flash-latest"];
+            let lastGradingError: any = null;
 
-            // Primary model: gemini-3.1-flash-lite with DETERMINISTIC decoding (temperature: 0.0, seed: 42)
-            try {
-                const response = await ai.models.generateContent({ 
-                    model: "gemini-3.1-flash-lite",
-                    contents: [{ role: "user", parts: sanitizedParts }],
-                    config: {
-                        temperature: 0.0,
-                        seed: 42,
-                        systemInstruction: gradingSystemInstruction,
-                        responseMimeType: "application/json",
-                        responseSchema: gradingSchema
+            for (const modelName of gradingModels) {
+                try {
+                    const response = await ai.models.generateContent({
+                        model: modelName,
+                        contents: [{ role: "user", parts: sanitizedParts }],
+                        config: {
+                            temperature: 0.0,
+                            seed: 42,
+                            systemInstruction: gradingSystemInstruction,
+                            responseMimeType: "application/json",
+                            responseSchema: gradingSchema
+                        }
+                    });
+                    responseText = response.text || "";
+                    if (responseText) break;
+                } catch (modelErr: any) {
+                    lastGradingError = modelErr;
+                    console.warn(`Grading model ${modelName} failed:`, modelErr.message);
+                    if (modelErr?.message?.includes("API_KEY_INVALID") || modelErr?.message?.includes("API key not valid")) {
+                        break;
                     }
-                });
-
-                responseText = response.text || "";
-            } catch (liteErr: any) {
-                console.warn("Primary gemini-3.1-flash-lite error, trying fallback gemini-flash-latest:", liteErr.message);
-                const fallbackRes = await ai.models.generateContent({ 
-                    model: "gemini-flash-latest",
-                    contents: [{ role: "user", parts: sanitizedParts }],
-                    config: {
-                        temperature: 0.0,
-                        seed: 42,
-                        systemInstruction: gradingSystemInstruction,
-                        responseMimeType: "application/json",
-                        responseSchema: gradingSchema
-                    }
-                });
-                responseText = fallbackRes.text || "";
+                }
             }
 
             if (!responseText) {
+                if (lastGradingError) throw lastGradingError;
                 throw new Error("AI không phản hồi kết quả chấm thi.");
             }
 
-            const cleanText = responseText.replace(/```json\n?|\n?```/g, '').trim();
-            const parsed = JSON.parse(cleanText);
+            const parsed = parseJsonWithLatexFix(responseText);
 
             const students = Array.isArray(parsed.students) && parsed.students.length > 0
                 ? parsed.students
@@ -470,7 +513,7 @@ async function startServer() {
                         score: parsed.score || "N/A",
                         totalScoreNum: parsed.totalScoreNum,
                         scoreText: parsed.scoreText || "",
-                        feedback: parsed.feedback || cleanText
+                        feedback: parsed.feedback || responseText
                     }
                 ];
 
@@ -485,13 +528,7 @@ async function startServer() {
             });
         } catch (error: any) {
             console.error("Final error grading submission:", error);
-            let message = error.message || "Lỗi không xác định khi chấm thi";
-            if (message.includes("API key not valid") || message.includes("API_KEY_INVALID")) {
-                message = "API key không hợp lệ hoặc đã hết hạn. Vui lòng chọn hoặc cấu hình lại API key.";
-            } else if (message.includes("DEADLINE_EXCEEDED") || message.includes("504") || message.includes("Headers Timeout") || message.includes("fetch failed")) {
-                message = "Thời gian xử lý của Gemini API quá hạn. Hệ thống đã tối ưu hóa, vui lòng bấm chấm lại hoặc chuyển sang mô hình Ollama cục bộ.";
-            }
-            res.status(500).json({ error: message });
+            res.status(500).json({ error: formatGeminiErrorMessage(error) });
         }
     });
 

@@ -29,148 +29,73 @@ const fileContentCache = new WeakMap<File, Promise<{
   mimeType: string;
 }>>();
 
-const pdfOllamaCache = new Map<string, Promise<{
+const pdfOllamaCache = new WeakMap<File, Promise<{
   text: string;
   images: string[];
-  headerImages: string[];
+  headerCropImage?: string;
   pageCount: number;
 }>>();
 
-const reconstructPdfPageText = (items: any[]): string => {
-  if (!Array.isArray(items) || items.length === 0) return '';
-  const lines: string[] = [];
-  let currentLine = '';
-  let prevY: number | null = null;
-  let prevEndX: number | null = null;
-  let prevFontSize = 10;
-
-  for (const item of items) {
-    if (!item || typeof item.str !== 'string') continue;
-    const str = item.str;
-    const transform = Array.isArray(item.transform) ? item.transform : null;
-    const fontSize = transform
-      ? Math.max(6, Math.hypot(transform[0] || 0, transform[1] || 0) || Math.abs(transform[3] || 0) || 10)
-      : prevFontSize;
-    const x = transform ? Number(transform[4]) : null;
-    const y = transform ? Number(transform[5]) : null;
-    const width = typeof item.width === 'number' ? item.width : str.length * fontSize * 0.45;
-
-    if (prevY !== null && y !== null && Math.abs(y - prevY) > Math.max(3, fontSize * 0.45)) {
-      if (currentLine.trim()) lines.push(currentLine.trim());
-      currentLine = str;
-      prevY = y;
-      prevEndX = x !== null ? x + width : null;
-      prevFontSize = fontSize;
-      continue;
-    }
-
-    if (currentLine.length > 0 && x !== null && prevEndX !== null) {
-      const gap = x - prevEndX;
-      if (gap > fontSize * 3.0 && !currentLine.endsWith('|') && str.trim()) {
-        currentLine += ' | ' + str;
-      } else if (gap > Math.max(1.2, fontSize * 0.18) && !/\s$/.test(currentLine) && !/^\s/.test(str)) {
-        currentLine += ' ' + str;
-      } else {
-        currentLine += str;
-      }
-    } else {
-      currentLine += str;
-    }
-
-    if (item.hasEOL) {
-      if (currentLine.trim()) lines.push(currentLine.trim());
-      currentLine = '';
-      prevY = null;
-      prevEndX = null;
-    } else {
-      if (y !== null) prevY = y;
-      if (x !== null) prevEndX = x + width;
-      prevFontSize = fontSize;
-    }
-  }
-
-  if (currentLine.trim()) lines.push(currentLine.trim());
-  return lines.join('\n').replace(/[ \t]{2,}/g, ' ').trim();
-};
-
-const renderRightPhachCropUpright = (srcCanvas: HTMLCanvasElement): string | null => {
+const cropAndRotateRightMargin = (sourceCanvas: HTMLCanvasElement): string | undefined => {
   try {
-    if (typeof document === 'undefined' || srcCanvas.width < 100 || srcCanvas.height < 100) return null;
-    // Standard Vietnamese exam sheets print Phách (Họ tên, Lớp, SBD) vertically along the right ~32% strip, rotated 90° clockwise.
-    // Crop tightly around that strip (avoiding far-left body and extreme edge margins) and rotate -90° counter-clockwise upright.
-    const sx = Math.floor(srcCanvas.width * 0.65);
-    const sw = Math.min(srcCanvas.width - sx, Math.floor(srcCanvas.width * 0.31));
-    const sy = Math.floor(srcCanvas.height * 0.06);
-    const sh = Math.min(srcCanvas.height - sy, Math.floor(srcCanvas.height * 0.88));
-    if (sw <= 20 || sh <= 20) return null;
+    const cropX = Math.floor(sourceCanvas.width * 0.58);
+    const cropW = sourceCanvas.width - cropX;
+    const cropH = sourceCanvas.height;
+    if (cropW <= 20 || cropH <= 20) return undefined;
 
-    const cropCanvas = document.createElement('canvas');
-    cropCanvas.width = sh;
-    cropCanvas.height = sw;
-    const cropCtx = cropCanvas.getContext('2d');
-    if (!cropCtx) return null;
+    const rotCanvas = document.createElement('canvas');
+    rotCanvas.width = cropH;
+    rotCanvas.height = cropW;
+    const rotCtx = rotCanvas.getContext('2d');
+    if (!rotCtx) return undefined;
 
-    cropCtx.fillStyle = '#FFFFFF';
-    cropCtx.fillRect(0, 0, cropCanvas.width, cropCanvas.height);
-    cropCtx.translate(0, cropCanvas.height);
-    cropCtx.rotate(-Math.PI / 2);
-    cropCtx.drawImage(srcCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
+    rotCtx.fillStyle = '#FFFFFF';
+    rotCtx.fillRect(0, 0, rotCanvas.width, rotCanvas.height);
+    rotCtx.translate(0, cropW);
+    rotCtx.rotate(-Math.PI / 2);
+    rotCtx.drawImage(sourceCanvas, cropX, 0, cropW, cropH, 0, 0, cropW, cropH);
 
-    const dataUrl = cropCanvas.toDataURL('image/jpeg', 0.92);
+    const dataUrl = rotCanvas.toDataURL('image/jpeg', 0.9);
     return dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-  } catch (err) {
-    console.warn('Could not create upright phach crop:', err);
-    return null;
+  } catch (e) {
+    console.warn('Could not crop and rotate right margin header:', e);
+    return undefined;
   }
 };
 
-export const extractPortraitPhachImageCrop = async (file: File): Promise<string | null> => {
-  if (typeof window === 'undefined' || typeof document === 'undefined') return null;
-  if (!file.type.startsWith('image/') && !/\.(jpe?g|png|webp|bmp)$/i.test(file.name)) return null;
-
+export const createRightStripRotatedBase64 = (base64: string, mimeType = 'image/jpeg'): Promise<string | undefined> => {
+  if (typeof document === 'undefined' || !base64) return Promise.resolve(undefined);
   return new Promise((resolve) => {
     const img = new Image();
-    const objectUrl = URL.createObjectURL(file);
     img.onload = () => {
-      URL.revokeObjectURL(objectUrl);
-      if (img.height <= img.width) {
-        resolve(null);
-        return;
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth || img.width;
+        canvas.height = img.naturalHeight || img.height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(undefined);
+          return;
+        }
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0);
+        resolve(cropAndRotateRightMargin(canvas));
+      } catch {
+        resolve(undefined);
       }
-      const targetMax = 1600;
-      const scale = Math.min(1, targetMax / Math.max(img.width, img.height, 1));
-      const w = Math.max(1, Math.round(img.width * scale));
-      const h = Math.max(1, Math.round(img.height * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        resolve(null);
-        return;
-      }
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillRect(0, 0, w, h);
-      ctx.drawImage(img, 0, 0, w, h);
-      resolve(renderRightPhachCropUpright(canvas));
     };
-    img.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      resolve(null);
-    };
-    img.src = objectUrl;
+    img.onerror = () => resolve(undefined);
+    img.src = `data:${mimeType};base64,${base64}`;
   });
 };
 
 export const extractPdfForOllama = async (
   file: File,
-  maxRenderPages = 5,
-  onlyRenderIfNoText = false
-): Promise<{ text: string; images: string[]; headerImages: string[]; pageCount: number }> => {
-  const cacheKey = `${file.name}:${file.size}:${file.lastModified}:${maxRenderPages}:${onlyRenderIfNoText ? 1 : 0}:v2`;
-  const existing = pdfOllamaCache.get(cacheKey);
-  if (existing) {
-    return existing;
+  maxRenderPages = 6
+): Promise<{ text: string; images: string[]; headerCropImage?: string; pageCount: number }> => {
+  if (pdfOllamaCache.has(file)) {
+    return pdfOllamaCache.get(file)!;
   }
 
   const promise = (async () => {
@@ -180,38 +105,32 @@ export const extractPdfForOllama = async (
     const pageCount = pdf.numPages || 0;
 
     const textParts: string[] = [];
-    const pages: any[] = [];
-    const maxTextPages = Math.min(pageCount, 20);
+    const images: string[] = [];
+    let headerCropImage: string | undefined;
 
+    const maxTextPages = Math.min(pageCount, 20);
     for (let p = 1; p <= maxTextPages; p++) {
       const page = await pdf.getPage(p);
-      pages.push(page);
       try {
         const textContent = await page.getTextContent();
-        const pageText = reconstructPdfPageText(textContent.items || []);
+        const pageText = (textContent.items || [])
+          .map((item: any) => ('str' in item ? item.str : ''))
+          .join(' ')
+          .replace(/\s+/g, ' ')
+          .trim();
         if (pageText) {
-          textParts.push(`[Trang ${p}]:\n${pageText}`);
+          textParts.push(`[Trang ${p}]: ${pageText}`);
         }
       } catch (txtErr) {
         console.warn(`Could not extract text from page ${p} of ${file.name}:`, txtErr);
       }
-    }
 
-    const combinedText = textParts.join('\n').trim();
-    const images: string[] = [];
-    const headerImages: string[] = [];
-    const shouldRenderImages = !onlyRenderIfNoText || combinedText.length < 80;
-
-    if (shouldRenderImages && typeof document !== 'undefined') {
-      const renderLimit = Math.min(pages.length, maxRenderPages);
-      for (let i = 0; i < renderLimit; i++) {
-        const page = pages[i];
+      if (p <= maxRenderPages && typeof document !== 'undefined') {
         try {
           const baseViewport = page.getViewport({ scale: 1 });
           const maxDim = Math.max(baseViewport.width, baseViewport.height, 1);
-          // Render Page 1 at higher resolution (1800px) to preserve handwritten formulas and Phách header details
-          const targetMax = i === 0 && !onlyRenderIfNoText ? 1800 : 1400;
-          const scale = Math.min(2.5, Math.max(1.0, targetMax / maxDim));
+          const targetMax = p === 1 ? 1600 : 1400;
+          const scale = Math.min(2.2, Math.max(1.0, targetMax / maxDim));
           const viewport = page.getViewport({ scale });
 
           const canvas = document.createElement('canvas');
@@ -222,32 +141,30 @@ export const extractPdfForOllama = async (
             ctx.fillStyle = '#FFFFFF';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
             await page.render({ canvasContext: ctx, viewport, canvas } as any).promise;
-
-            // On Page 1 of student submissions, extract upright rotated right-strip Phách header
-            if (i === 0 && !onlyRenderIfNoText && canvas.height > canvas.width) {
-              const phachB64 = renderRightPhachCropUpright(canvas);
-              if (phachB64) headerImages.push(phachB64);
-            }
-
             const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
             const b64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
-            if (b64) images.push(b64);
+            if (b64) {
+              images.push(b64);
+              if (p === 1) {
+                headerCropImage = cropAndRotateRightMargin(canvas);
+              }
+            }
           }
         } catch (renderErr) {
-          console.warn(`Could not render page ${i + 1} of ${file.name} for Ollama:`, renderErr);
+          console.warn(`Could not render page ${p} of ${file.name} for Ollama:`, renderErr);
         }
       }
     }
 
     return {
-      text: combinedText,
+      text: textParts.join('\n').trim(),
       images,
-      headerImages,
+      headerCropImage,
       pageCount,
     };
   })();
 
-  pdfOllamaCache.set(cacheKey, promise);
+  pdfOllamaCache.set(file, promise);
   return promise;
 };
 

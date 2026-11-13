@@ -98,8 +98,10 @@ const App: React.FC = () => {
                 ? `${ollamaErr.message} Hệ thống đã tạm dùng Gemini Cloud để hoàn tất.`
                 : `Ollama cục bộ tại ${ollamaConfig.baseUrl} không phản hồi. Hệ thống đã tự động chuyển sang Gemini Cloud AI để hoàn tất tạo đề.`
             );
-          } catch {
-            throw ollamaErr;
+          } catch (geminiErr: any) {
+            throw new Error(
+              `Ollama lỗi: ${ollamaErr?.message || 'Không phản hồi'}\n\nĐồng thời Gemini Cloud cũng lỗi: ${geminiErr?.message || 'Không xác định'}`
+            );
           }
         }
       } else {
@@ -201,8 +203,10 @@ const App: React.FC = () => {
                   ? `${ollamaErr.message} Hệ thống đã tạm dùng Gemini Cloud để hoàn tất.`
                   : "Ollama cục bộ không phản hồi. Đã hoàn tất chấm điểm bằng Gemini Cloud AI."
               );
-            } catch {
-              throw ollamaErr;
+            } catch (geminiErr: any) {
+              throw new Error(
+                `Ollama lỗi: ${ollamaErr?.message || 'Không phản hồi'} | Gemini Cloud cũng lỗi: ${geminiErr?.message || 'Không xác định'}`
+              );
             }
           } else {
             throw ollamaErr;
@@ -316,8 +320,10 @@ const App: React.FC = () => {
                   ? `${ollamaErr.message} Hệ thống đã tạm dùng Gemini Cloud AI để hoàn tất.`
                   : "Ollama cục bộ tại localhost:11434 không phản hồi (chưa khởi chạy hoặc chặn kết nối). Hệ thống đã tự động chuyển sang Gemini Cloud AI để hoàn tất chấm bài mà không bị gián đoạn."
               );
-            } catch {
-              throw ollamaErr;
+            } catch (geminiErr: any) {
+              throw new Error(
+                `Ollama lỗi: ${ollamaErr?.message || 'Không phản hồi'} | Gemini Cloud cũng lỗi: ${geminiErr?.message || 'Không xác định'}`
+              );
             }
           }
         } else {
